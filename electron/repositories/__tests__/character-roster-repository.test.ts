@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createRequire } from 'node:module'
+import { createHash } from 'node:crypto'
 import type BetterSqlite3 from 'better-sqlite3'
 
 import { getProjectDb } from '../../database'
@@ -79,8 +80,10 @@ beforeEach(() => {
       abilities TEXT DEFAULT '',
       motivation TEXT DEFAULT '',
       relationships TEXT DEFAULT '',
+      relationship_notes TEXT DEFAULT '',
       arc TEXT DEFAULT '',
       notes TEXT DEFAULT '',
+      avatar TEXT NOT NULL DEFAULT '',
       cs_location TEXT DEFAULT '',
       cs_power_level TEXT DEFAULT '',
       cs_physical_state TEXT DEFAULT '',
@@ -101,6 +104,12 @@ beforeEach(() => {
       chapter_number INTEGER NOT NULL,
       status TEXT NOT NULL
     );
+    CREATE TABLE finalization_outbox (
+      finalization_id TEXT PRIMARY KEY,
+      draft_id INTEGER NOT NULL UNIQUE,
+      chapter_number INTEGER NOT NULL,
+      content_hash TEXT NOT NULL
+    );
   `)
   ensureCharacterRosterSchema(db)
   vi.mocked(getProjectDb).mockReturnValue(db)
@@ -109,6 +118,27 @@ beforeEach(() => {
 afterEach(() => {
   db.close()
 })
+
+function finalizedSource(draftId: number, chapterNumber: number) {
+  return {
+    draftId,
+    finalizationId: `finalization-${draftId}`,
+    chapterNumber,
+    contentHash: String(draftId).padStart(64, '0'),
+  }
+}
+
+function insertDraft(draftId: number, chapterNumber: number, status: 'draft' | 'finalized'): void {
+  db.prepare('INSERT INTO drafts (id, chapter_number, status) VALUES (?, ?, ?)')
+    .run(draftId, chapterNumber, status)
+  if (status === 'finalized') {
+    const source = finalizedSource(draftId, chapterNumber)
+    db.prepare(`
+      INSERT INTO finalization_outbox (finalization_id, draft_id, chapter_number, content_hash)
+      VALUES (?, ?, ?, ?)
+    `).run(source.finalizationId, source.draftId, source.chapterNumber, source.contentHash)
+  }
+}
 
 function rawRosterStorage() {
   return {
@@ -128,6 +158,84 @@ function rawRosterStorage() {
 }
 
 describe('CharacterRosterRepository public read/commit seam', () => {
+  it('keeps a pre-provenance ready roster ready after adding the empty provenance column', () => {
+    const request = commitRequest({
+      entries: commitRequest().entries.map((entry, index) => index === 0
+        ? {
+            ...entry,
+            currentState: {
+              location: '旧港口',
+              powerLevel: '学徒',
+              physicalState: '轻伤',
+              mentalState: '警觉',
+              keyItems: '旧剑',
+              recentEvents: '刚抵达港口',
+              updatedAtChapter: 1,
+            },
+          }
+        : entry),
+    })
+    const committed = CharacterRosterRepository.commit(request)
+    const legacyEntries = committed.snapshot.entries.map((entry) => {
+      if (!entry.currentState) return entry
+      const currentState = { ...entry.currentState }
+      delete currentState.provenance
+      return { ...entry, currentState }
+    })
+    const legacyFactHash = createHash('sha256')
+      .update(JSON.stringify(legacyEntries), 'utf8')
+      .digest('hex')
+    db.prepare("UPDATE character_roster_meta SET fact_hash = ? WHERE id = 'main'").run(legacyFactHash)
+    db.exec('ALTER TABLE characters DROP COLUMN cs_provenance')
+
+    ensureCharacterRosterSchema(db)
+
+    const upgraded = CharacterRosterRepository.read()
+    expect(upgraded).toMatchObject({ status: 'ready', factHash: legacyFactHash })
+    expect(upgraded.entries[0]?.currentState).not.toHaveProperty('provenance')
+  })
+
+  /**
+   * 先生反馈：给反派设好头像、保存之后，主角的头像就变空白。
+   * 根因是手工保存走「清空 characters 再回填」，而 avatar 刻意不在 upsert
+   * 的写入列表里 —— 清表把全名单的头像文件名一起抹掉了，随后角色卡的头像
+   * 提交只会写回当前那一个角色。头像必须跨手工保存原样存活。
+   */
+  it('keeps every author avatar across a manual save that rewrites the whole card table', () => {
+    const initial = CharacterRosterRepository.commit(commitRequest({ intent: 'manual_edit' }))
+    db.prepare('UPDATE characters SET avatar = ? WHERE name = ?').run('1111111111111111.png', '林舟')
+    db.prepare('UPDATE characters SET avatar = ? WHERE name = ?').run('2222222222222222.webp', '苏绾')
+
+    const saved = CharacterRosterRepository.commit({
+      operationId: 'manual-save-with-avatars',
+      expectedRevision: initial.revision,
+      schemaVersion: 1,
+      intent: 'manual_edit',
+      entries: commitRequest().entries.map(entry => ({ ...entry, notes: `${entry.name} 的新备注` })),
+    })
+
+    // 保存任意一个角色都不得动到其他角色的头像。
+    expect(CharacterRepository.getAvatarFileName('林舟')).toBe('1111111111111111.png')
+    expect(CharacterRepository.getAvatarFileName('苏绾')).toBe('2222222222222222.webp')
+
+    // 改名时头像随新身份一起搬过去（文件名与角色名解耦，无需重命名文件）。
+    const renamed = CharacterRosterRepository.commit({
+      operationId: 'manual-rename-keeps-avatar',
+      expectedRevision: saved.revision,
+      schemaVersion: 1,
+      intent: 'manual_edit',
+      renames: [{ originalName: '苏绾', newName: '苏绾绾' }],
+      entries: commitRequest().entries.map(entry => ({
+        ...entry,
+        name: entry.name === '苏绾' ? '苏绾绾' : entry.name,
+      })),
+    })
+
+    expect(renamed.snapshot.entries.map(entry => entry.name).sort()).toEqual(['林舟', '苏绾绾'])
+    expect(CharacterRepository.getAvatarFileName('苏绾绾')).toBe('2222222222222222.webp')
+    expect(CharacterRepository.getAvatarFileName('林舟')).toBe('1111111111111111.png')
+  })
+
   it('normalizes a finite numeric model age without widening other roster fields', () => {
     const base = commitRequest()
     const numericAge = {
@@ -263,7 +371,7 @@ describe('CharacterRosterRepository public read/commit seam', () => {
           ? {
               ...entry,
               relationships: [],
-              legacyRelationshipNotes: '作者手写的自由关系备注，不能被结构化保存吞掉',
+              relationshipNotes: '作者手写的自由关系备注，不能被结构化保存吞掉',
             }
           : entry
       )),
@@ -302,7 +410,7 @@ describe('CharacterRosterRepository public read/commit seam', () => {
         entries: [expect.objectContaining({
           name: '陆舟',
           relationships: [],
-          legacyRelationshipNotes: '作者手写的自由关系备注，不能被结构化保存吞掉',
+          relationshipNotes: '作者手写的自由关系备注，不能被结构化保存吞掉',
           currentState: expect.objectContaining({ updatedAtChapter: 3 }),
         })],
       },
@@ -343,14 +451,19 @@ describe('CharacterRosterRepository public read/commit seam', () => {
     expect(CharacterRepository.getByName('林舟')?.notes).toBe('旧旁路直接改写了角色事实')
   })
 
-  it('rejects free-text relationship evidence outside a manual edit', () => {
-    expect(() => CharacterRosterRepository.commit(commitRequest({
+  it('accepts a free-text relationship note from an import candidate', () => {
+    // 关系备注是一等事实：导入通道不再拒收它，结构化边与原文并存。
+    const receipt = CharacterRosterRepository.commit(commitRequest({
       intent: 'novel_import',
       entries: commitRequest().entries.map(entry => ({
         ...entry,
-        legacyRelationshipNotes: '导入候选不得携带旧自由文本关系',
+        relationshipNotes: '导入候选带来的关系原话',
       })),
-    }))).toThrow(/只有手工角色管理可以提交自由文本关系/)
+    }))
+
+    expect(receipt.snapshot.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: '林舟', relationshipNotes: '导入候选带来的关系原话' }),
+    ]))
   })
 
   it('commits a validated roster and its deterministic projection as one ready snapshot', () => {
@@ -599,7 +712,7 @@ describe('CharacterRosterRepository public read/commit seam', () => {
       entries: [expect.objectContaining({
         name: '手工角色',
         notes: '用户手工填写',
-        legacyRelationshipNotes: '自由文本关系必须原样保留',
+        relationshipNotes: '自由文本关系必须原样保留',
       })],
     })
     expect(() => CharacterRosterRepository.commit(commitRequest()))
@@ -634,11 +747,7 @@ describe('CharacterRosterRepository public read/commit seam', () => {
       operationId: 'adopt-before-architecture-regeneration',
       expectedRevision: preserved.revision,
       schemaVersion: 1,
-      entries: preserved.entries.map((entry) => {
-        const structuredEntry = { ...entry }
-        delete structuredEntry.legacyRelationshipNotes
-        return structuredEntry
-      }),
+      entries: preserved.entries.map(entry => ({ ...entry })),
       intent: 'legacy_cards_adoption',
       expectedLegacyMarkdown: preserved.legacyMarkdown ?? '',
     })
@@ -661,7 +770,7 @@ describe('CharacterRosterRepository public read/commit seam', () => {
           appearance: '作者手写的旧斗篷',
           notes: '作者已确认，不应覆盖',
           background: '铁砧镇学徒',
-          legacyRelationshipNotes: '作者手工填写的旧关系备注，不得被生成 JSON 覆盖',
+          relationshipNotes: '作者手工填写的旧关系备注，不得被生成 JSON 覆盖',
         }),
         expect.objectContaining({ name: '苏绾', role: 'supporting' }),
       ]),
@@ -670,11 +779,11 @@ describe('CharacterRosterRepository public read/commit seam', () => {
       expect.objectContaining({
         name: '林舟',
         appearance: '作者手写的旧斗篷',
-        legacyRelationshipNotes: '作者手工填写的旧关系备注，不得被生成 JSON 覆盖',
+        relationshipNotes: '作者手工填写的旧关系备注，不得被生成 JSON 覆盖',
       }),
       expect.objectContaining({ name: '苏绾' }),
     ]))
-    expect(CharacterRepository.getByName('林舟')?.relationships)
+    expect(CharacterRepository.getByName('林舟')?.relationshipNotes)
       .toBe('作者手工填写的旧关系备注，不得被生成 JSON 覆盖')
   })
 
@@ -756,6 +865,78 @@ describe('CharacterRosterRepository public read/commit seam', () => {
       ])
     },
   )
+
+  it('replaces the roster on architecture regeneration by removing characters absent from the new list', () => {
+    const first = CharacterRosterRepository.commit(commitRequest())
+    expect(CharacterRepository.getByName('苏绾')).not.toBeNull()
+
+    const replaced = CharacterRosterRepository.commit({
+      operationId: 'architecture-regeneration-replaces-roster',
+      expectedRevision: first.revision,
+      schemaVersion: 1,
+      intent: 'architecture_generation',
+      entries: [{
+        name: '林舟',
+        role: 'antagonist',
+        gender: '男',
+        age: '十九岁',
+        appearance: '玄色长袍',
+        personality: '偏执',
+        background: '旧王朝遗臣',
+        abilities: '阵法',
+        motivation: '复辟旧朝',
+        relationships: [],
+        arc: '承认失败',
+        notes: '',
+      }],
+    })
+
+    // 「将覆盖」必须名副其实：新名单里没有的角色要连同角色卡一起消失，
+    // 否则多轮生成的设定会同时留在名单里，下游会读到互相矛盾的角色事实。
+    expect(replaced.snapshot.entries.map(entry => entry.name)).toEqual(['林舟'])
+    expect(CharacterRepository.getByName('苏绾')).toBeNull()
+    expect(CharacterRepository.count()).toBe(1)
+    expect(CharacterRosterRepository.read().entries.map(entry => entry.name)).toEqual(['林舟'])
+    expect(replaced.snapshot.renderedMarkdown).not.toContain('苏绾')
+    // 刻意保留的作者保护：同名条目的非空人工字段仍然 manual-wins。
+    expect(replaced.snapshot.entries[0]).toMatchObject({
+      name: '林舟',
+      role: 'protagonist',
+      appearance: '灰袍少年',
+      notes: '左手有旧伤',
+    })
+    // 关系取本轮生成结果，不留下指向已移除角色的悬空端点。
+    expect(replaced.snapshot.entries[0].relationships).toEqual([])
+  })
+
+  it('keeps unlisted characters when a novel import merges its candidates', () => {
+    const first = CharacterRosterRepository.commit(commitRequest())
+    const merged = CharacterRosterRepository.commit({
+      operationId: 'novel-import-keeps-unlisted',
+      expectedRevision: first.revision,
+      schemaVersion: 1,
+      intent: 'novel_import',
+      entries: [{
+        name: '顾临',
+        role: 'antagonist',
+        gender: '男',
+        age: '三十岁',
+        appearance: '玄铁面具',
+        personality: '偏执',
+        background: '旧王朝遗臣',
+        abilities: '阵法',
+        motivation: '复辟旧朝',
+        relationships: [],
+        arc: '承认失败',
+        notes: '',
+      }],
+    })
+
+    // 仿写导入仍然保守合并：它没有「覆盖」承诺，未列出的旧角色必须保留。
+    expect(merged.snapshot.entries.map(entry => entry.name).sort())
+      .toEqual(['林舟', '苏绾', '顾临'].sort())
+    expect(CharacterRepository.getByName('苏绾')).not.toBeNull()
+  })
 
   it('archives legacy Markdown as migration evidence instead of parsing it as a roster', () => {
     db.exec(`
@@ -911,18 +1092,14 @@ describe('CharacterRosterRepository public read/commit seam', () => {
     expect(before).toMatchObject({
       migrationState: 'legacy_cards_preserved',
       status: 'inconsistent',
-      entries: [expect.objectContaining({ legacyRelationshipNotes: '作者手工填写的自由文本关系，必须原样保留' })],
+      entries: [expect.objectContaining({ relationshipNotes: '作者手工填写的自由文本关系，必须原样保留' })],
     })
 
     const receipt = CharacterRosterRepository.commit({
       operationId: 'adopt-existing-cards',
       expectedRevision: before.revision,
       schemaVersion: 1,
-      entries: before.entries.map((entry) => {
-        const structuredEntry = { ...entry }
-        delete structuredEntry.legacyRelationshipNotes
-        return structuredEntry
-      }),
+      entries: before.entries.map(entry => ({ ...entry })),
       intent: 'legacy_cards_adoption',
       expectedLegacyMarkdown: legacyMarkdown,
     })
@@ -939,7 +1116,7 @@ describe('CharacterRosterRepository public read/commit seam', () => {
 
   it('rejects chapter-progress additions and canonical duplicate names at the repository boundary', () => {
     const initial = CharacterRosterRepository.commit(commitRequest())
-    db.prepare('INSERT INTO drafts (id, chapter_number, status) VALUES (?, ?, ?)').run(2, 2, 'finalized')
+    insertDraft(2, 2, 'finalized')
     const existing = initial.snapshot.entries[0]
     const unknown = {
       ...existing,
@@ -961,6 +1138,7 @@ describe('CharacterRosterRepository public read/commit seam', () => {
       expectedRevision: initial.revision,
       schemaVersion: 1,
       intent: 'chapter_progress',
+      source: finalizedSource(2, 2),
       entries: [unknown],
     })).toThrow(/不能创建未知角色/)
     expect(CharacterRosterRepository.read()).toEqual(initial.snapshot)
@@ -970,6 +1148,7 @@ describe('CharacterRosterRepository public read/commit seam', () => {
       expectedRevision: initial.revision,
       schemaVersion: 1,
       intent: 'chapter_progress',
+      source: finalizedSource(2, 2),
       entries: [
         { ...existing, relationships: [] },
         { ...existing, name: ` ${existing.name.toLocaleUpperCase('en-US')} `, relationships: [] },
@@ -995,8 +1174,8 @@ describe('CharacterRosterRepository public read/commit seam', () => {
         },
       })),
     })
-    db.prepare('INSERT INTO drafts (id, chapter_number, status) VALUES (?, ?, ?)').run(2, 2, 'finalized')
-    db.prepare('INSERT INTO drafts (id, chapter_number, status) VALUES (?, ?, ?)').run(3, 3, 'finalized')
+    insertDraft(2, 2, 'finalized')
+    insertDraft(3, 3, 'finalized')
     const existing = initial.snapshot.entries[0]
 
     expect(() => CharacterRosterRepository.commit({
@@ -1004,6 +1183,7 @@ describe('CharacterRosterRepository public read/commit seam', () => {
       expectedRevision: initial.revision,
       schemaVersion: 1,
       intent: 'chapter_progress',
+      source: finalizedSource(2, 2),
       entries: [{
         ...existing,
         relationships: [],
@@ -1012,7 +1192,7 @@ describe('CharacterRosterRepository public read/commit seam', () => {
     })).toThrow(/较新章节更新/)
   })
 
-  it('repairs a future character-state chapter when no such finalized draft exists', () => {
+  it('preserves a non-empty legacy state instead of reclassifying it as derived', () => {
     const base = commitRequest()
     const initial = CharacterRosterRepository.commit({
       ...base,
@@ -1029,7 +1209,7 @@ describe('CharacterRosterRepository public read/commit seam', () => {
         },
       })),
     })
-    db.prepare('INSERT INTO drafts (id, chapter_number, status) VALUES (?, ?, ?)').run(2, 2, 'finalized')
+    insertDraft(2, 2, 'finalized')
     const existing = initial.snapshot.entries[0]
 
     const receipt = CharacterRosterRepository.commit({
@@ -1037,15 +1217,24 @@ describe('CharacterRosterRepository public read/commit seam', () => {
       expectedRevision: initial.revision,
       schemaVersion: 1,
       intent: 'chapter_progress',
+      source: finalizedSource(2, 2),
       entries: [{
         ...existing,
         relationships: [],
-        currentState: { ...existing.currentState!, location: '第二章现场', updatedAtChapter: 2 },
+        currentState: {
+          ...existing.currentState!,
+          location: '第二章现场',
+          updatedAtChapter: 2,
+          provenance: {
+            ...existing.currentState!.provenance,
+            location: { kind: 'derived', source: finalizedSource(2, 2) },
+          },
+        },
       }],
     })
 
     expect(receipt.snapshot.entries.find(entry => entry.name === existing.name)?.currentState)
-      .toMatchObject({ location: '第二章现场', updatedAtChapter: 2 })
+      .toMatchObject({ location: '受污染的未来状态', updatedAtChapter: 3 })
   })
 
   it('rejects chapter progress whose candidate chapter is not finalized', () => {
@@ -1065,7 +1254,7 @@ describe('CharacterRosterRepository public read/commit seam', () => {
         },
       })),
     })
-    db.prepare('INSERT INTO drafts (id, chapter_number, status) VALUES (?, ?, ?)').run(2, 2, 'draft')
+    insertDraft(2, 2, 'draft')
     const existing = initial.snapshot.entries[0]
 
     expect(() => CharacterRosterRepository.commit({
@@ -1073,11 +1262,68 @@ describe('CharacterRosterRepository public read/commit seam', () => {
       expectedRevision: initial.revision,
       schemaVersion: 1,
       intent: 'chapter_progress',
+      source: finalizedSource(2, 2),
       entries: [{
         ...existing,
         relationships: [],
         currentState: { ...existing.currentState!, location: '第二章现场', updatedAtChapter: 2 },
       }],
-    })).toThrow(/尚未定稿/)
+    })).toThrow(/来源已失效/)
+  })
+
+  it('preserves an author field while accepting a derived patch for a different empty field', () => {
+    const initial = CharacterRosterRepository.commit(commitRequest())
+    const authored = CharacterRosterRepository.commit({
+      operationId: 'manual-state-source',
+      expectedRevision: initial.revision,
+      schemaVersion: 1,
+      intent: 'manual_edit',
+      entries: initial.snapshot.entries.map((entry, index) => index === 0 ? {
+        ...entry,
+        currentState: {
+          location: '作者设定的山庄',
+          powerLevel: '',
+          physicalState: '',
+          mentalState: '',
+          keyItems: '',
+          recentEvents: '',
+          updatedAtChapter: 1,
+        },
+      } : entry),
+    })
+    insertDraft(2, 2, 'finalized')
+    const existing = authored.snapshot.entries[0]!
+    const source = finalizedSource(2, 2)
+
+    const derived = CharacterRosterRepository.commit({
+      operationId: 'derived-state-source',
+      expectedRevision: authored.revision,
+      schemaVersion: 1,
+      intent: 'chapter_progress',
+      source,
+      entries: [{
+        ...existing,
+        currentState: {
+          ...existing.currentState!,
+          location: '模型试图覆盖的码头',
+          mentalState: '警觉',
+          updatedAtChapter: 2,
+          provenance: {
+            location: { kind: 'derived', source },
+            mentalState: { kind: 'derived', source },
+          },
+        },
+      }],
+    })
+
+    expect(derived.snapshot.entries[0]?.currentState).toMatchObject({
+      location: '作者设定的山庄',
+      mentalState: '警觉',
+      updatedAtChapter: 2,
+      provenance: {
+        location: { kind: 'author', chapterNumber: 1 },
+        mentalState: { kind: 'derived', source },
+      },
+    })
   })
 })

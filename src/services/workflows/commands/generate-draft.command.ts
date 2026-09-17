@@ -39,19 +39,39 @@ import type { NarrativeThreadView } from '../../../shared/narrative-thread'
 import { promptLanguageText } from '../../prompt-language'
 import { countDraftUnits } from '../../../shared/draft-units'
 import type { RecoveryChapterSource } from '../../../shared/recovery-candidate'
+import { CHARACTER_STATE_TEXT_FIELDS } from '../../../shared/character-roster'
+import {
+  assembleChapterMaterials,
+  type ChapterMaterialReference,
+  type FinalizedMaterialSource,
+  type SelectedCandidateDraft,
+} from '../chapter-materials'
+import type { DraftSourceDependency } from '../../../shared/draft-source-dependency'
+import type { WorldSettingEntry } from '../../../shared/world-setting'
 
 export { countDraftUnits } from '../../../shared/draft-units'
+export { previousChapterEnding } from '../chapter-materials'
 
 const CONTINUE_PROMPT_MAX_CHARS = 1600
-const MIN_TARGET_COMPLETION_RATIO = 0.82
+const MIN_TARGET_COMPLETION_RATIO = 0.8
 const MAX_AUTO_CONTINUE_ROUNDS = 7
-const PREVIOUS_ENDING_MAX_CHARS = 1000
 const NEXT_CHAPTER_HEAD_MAX_CHARS = 1200
 const CROSS_CHAPTER_REUSE_CJK_NGRAM_CHARS = 8
 const CROSS_CHAPTER_REUSE_ENGLISH_NGRAM_CHARS = 20
 const CROSS_CHAPTER_REUSE_LONG_RUN_CHARS = 80
 const ACTIVE_THREAD_CONTEXT_MAX_CHARS = 1200
 const ACTIVE_THREAD_CONTEXT_MAX_ITEMS = 6
+
+/**
+ * 章节引用注入世界观设定的上限（先生定的铁律：每章只注入被引用的，绝不全量）。
+ *
+ * 这两个数与「单条截断」一起构成三道闸门：即使作者把上百条设定挂到同一章，
+ * 进提示词的也是一个常数级文本量，不会把上下文预算打穿。
+ */
+const CHAPTER_WORLD_SETTING_MAX_ENTRIES = 8
+const CHAPTER_WORLD_SETTING_TOTAL_MAX_CHARS = 2400
+/** 单条设定的正文上限；超过就退回用摘要（摘要本来就是为进提示词准备的）。 */
+const CHAPTER_WORLD_SETTING_CONTENT_MAX_CHARS = 1200
 const STREAM_PREVIEW_INTERVAL_MS = 250
 export function sanitizeDraftText(text: string): string {
   const cleaned = stripThinkingTags(text)
@@ -147,11 +167,8 @@ export interface GenerateDraftCommandDependencies {
 }
 
 export interface GenerateDraftCommandOptions {
-  /**
-   * Ephemeral ending from the immediately preceding draft in the same batch.
-   * It is prompt-only context and must never be persisted as finalized state.
-   */
-  readonly previousDraftEnding?: string
+  /** Exact saved draft versions selected by this batch; never inferred as finalized history. */
+  readonly selectedCandidateDrafts?: readonly SelectedCandidateDraft[]
   readonly dependencies?: Partial<GenerateDraftCommandDependencies>
 }
 
@@ -159,16 +176,29 @@ const DEFAULT_DEPENDENCIES: GenerateDraftCommandDependencies = {
   createRuntime: options => createGenerationRuntime(options),
 }
 
-/** Use the same bounded previous-ending window for finalized and in-batch prose. */
-export function previousChapterEnding(content: string): string {
-  const trimmed = content.trim()
-  if (trimmed.length <= PREVIOUS_ENDING_MAX_CHARS) return trimmed
+type WriterChapterInfo = Pick<ChapterInfo,
+  | 'chapterNumber'
+  | 'title'
+  | 'role'
+  | 'purpose'
+  | 'characters'
+  | 'keyEvents'
+  | 'suspenseHook'
+  | 'userGuidance'
+>
 
-  const tail = trimmed.slice(-PREVIOUS_ENDING_MAX_CHARS)
-  const firstBoundary = /(?:\r?\n\s*\r?\n|[。！？!?][”’"'）)\]】」』]*|\.[”’"')\]]*(?=\s|$))/u.exec(tail)
-  if (!firstBoundary) return tail.trim()
-
-  return tail.slice(firstBoundary.index + firstBoundary[0].length).trim() || tail.trim()
+/** Keep workflow metadata out of both initial and continuation writer prompts. */
+function toWriterChapterInfo(chapterInfo: ChapterInfo): WriterChapterInfo {
+  return {
+    chapterNumber: chapterInfo.chapterNumber,
+    title: chapterInfo.title,
+    role: chapterInfo.role,
+    purpose: chapterInfo.purpose,
+    characters: chapterInfo.characters,
+    keyEvents: chapterInfo.keyEvents,
+    suspenseHook: chapterInfo.suspenseHook,
+    userGuidance: chapterInfo.userGuidance,
+  }
 }
 
 function hasSubstantialPreviousChapterReuse(
@@ -275,6 +305,98 @@ function recoveryChapterSource(chapter: ChapterInfo): RecoveryChapterSource {
   }
 }
 
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+}
+
+type ChapterHeading = Readonly<{
+  lineIndex: number
+  from: number
+  to: number
+  markdownLevel: number
+}>
+
+function parseChapterHeading(line: string, lineIndex: number): ChapterHeading | null {
+  const match = /^\s*(?:(#{1,6})[\t ]+)?(?:第\s*([1-9]\d*)(?:\s*[–—-]\s*([1-9]\d*))?\s*章|Chapters?[\t ]+([1-9]\d*)(?:[\t ]*[–—-][\t ]*([1-9]\d*))?)(?=[\t ]*(?:[:：.．—-]|$))/iu.exec(line)
+  if (!match) return null
+  // Bare headings must use the production outline's explicit title separator.
+  if (!match[1] && !/^[\t ]*[:：]\s*\S/u.test(line.slice(match[0].length))) return null
+  const from = Number(match[2] ?? match[4])
+  const to = Number(match[3] ?? match[5] ?? from)
+  return {
+    lineIndex,
+    from,
+    to,
+    markdownLevel: match[1]?.length ?? 0,
+  }
+}
+
+/**
+ * Project an explicitly chapter-structured synopsis onto one chapter without
+ * cutting any selected section. Ambiguous or unlocatable structures stay
+ * verbatim so author facts are never discarded on a guess.
+ *
+ * 这一层是「章节级生成」的关键：大纲里前后各章的段落不进本章提示词，
+ * 提示词长度因此与全书章节数无关，模型也不会被后面章节的情节带跑。
+ */
+export function synopsisForDraftChapter(synopsis: string, chapterNumber: number): string {
+  // Quoted examples can contain chapter-like headings; do not interpret them.
+  if (/^\s*(?:`{3,}|~{3,})/mu.test(synopsis)) return synopsis.trim()
+  const lines = synopsis.trim().split(/\r?\n/u)
+  const headings = lines
+    .map((line, lineIndex) => parseChapterHeading(line, lineIndex))
+    .filter((heading): heading is ChapterHeading => heading !== null)
+  if (headings.length < 2) return synopsis.trim()
+
+  const firstLevel = headings[0]!.markdownLevel
+  const hasConsistentHeadingStyle = headings.every(heading => heading.markdownLevel === firstLevel)
+  const hasStrictChapterOrder = headings.every((heading, index) => (
+    heading.from <= heading.to
+    && (index === 0 || heading.from > headings[index - 1]!.to)
+  ))
+  const currentHeadings = headings.filter(heading => heading.from <= chapterNumber && chapterNumber <= heading.to)
+  if (!hasConsistentHeadingStyle || !hasStrictChapterOrder || currentHeadings.length !== 1) {
+    return synopsis.trim()
+  }
+
+  const headingsByLine = new Map(headings.map(heading => [heading.lineIndex, heading]))
+  let activeRange: Pick<ChapterHeading, 'from' | 'to'> | null = null
+  const projected: string[] = []
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex]!
+    const chapterHeading = headingsByLine.get(lineIndex)
+    if (chapterHeading) {
+      activeRange = chapterHeading
+    } else {
+      const markdownHeading = /^\s*(#{1,6})\s+/u.exec(line)
+      if (markdownHeading && (firstLevel === 0 || markdownHeading[1]!.length <= firstLevel)) {
+        activeRange = null
+      }
+    }
+    if (
+      activeRange === null
+      || (activeRange.from <= chapterNumber && chapterNumber <= activeRange.to)
+    ) projected.push(line)
+  }
+  return projected.join('\n').trim()
+}
+
+function exactParagraphs(values: readonly string[]): ReadonlySet<string> {
+  return new Set(values.flatMap(value => (
+    value.split(/\r?\n\s*\r?\n/u).map(paragraph => paragraph.trim()).filter(Boolean)
+  )))
+}
+
+/** 作者在小说配置里已经写过的事实不再重复注入一次（同一段只出现一次）。 */
+function withoutExactParagraphDuplicates(content: string, duplicates: ReadonlySet<string>): string {
+  return content
+    .split(/\r?\n\s*\r?\n/u)
+    .map(paragraph => paragraph.trim())
+    .filter(paragraph => paragraph && !duplicates.has(paragraph))
+    .join('\n\n')
+}
+
 /** Join a visible continuation without allowing a repeated prompt tail to count as new prose. */
 export function appendVisibleDraftContinuation(draft: string, continuation: string): string {
   return appendVisibleTextContinuation(draft, continuation, sanitizeDraftText)
@@ -282,7 +404,7 @@ export function appendVisibleDraftContinuation(draft: string, continuation: stri
 
 export class GenerateDraftCommand extends BaseWorkflowCommand {
   private readonly dependencies: GenerateDraftCommandDependencies
-  private readonly previousDraftEnding: string | undefined
+  private readonly selectedCandidateDrafts: readonly SelectedCandidateDraft[]
 
   constructor(
     private chapterInfo: ChapterInfo,
@@ -290,9 +412,7 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
   ) {
     super()
     this.dependencies = { ...DEFAULT_DEPENDENCIES, ...options.dependencies }
-    this.previousDraftEnding = options.previousDraftEnding
-      ? previousChapterEnding(options.previousDraftEnding)
-      : undefined
+    this.selectedCandidateDrafts = Object.freeze([...(options.selectedCandidateDrafts ?? [])])
   }
 
   async execute({ step, context, callbacks }: CommandExecuteParams): Promise<string> {
@@ -323,7 +443,18 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
       'Building chapter context...',
     ))
 
-    const architecture = await this.readArchitecture(expectedProjectPath, projectSession)
+    const authoredConfigFacts = [
+      novelConfig.coreOutline,
+      novelConfig.worldSetting,
+      novelConfig.goldenFinger,
+      novelConfig.protagonistProfile,
+    ].filter((value): value is string => typeof value === 'string' && Boolean(value.trim()))
+    const architecture = await this.readArchitecture(
+      expectedProjectPath,
+      projectSession,
+      this.chapterInfo.chapterNumber,
+      authoredConfigFacts,
+    )
     const projectPrompts = await this.readProjectPrompts(
       expectedProjectPath,
       projectSession,
@@ -334,7 +465,7 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
       projectPrompts,
     ].filter(Boolean).join('\n\n')
 
-    const characterState = await this.readCharacterStates(
+    const characterProfiles = await this.readCharacterProfiles(
       expectedProjectPath,
       projectSession,
       writingLanguage,
@@ -373,13 +504,101 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
     // 以最大化 LLM 上下文缓存命中率
     // ==========================================
     const writingStyle = novelConfig.writingStyle?.trim() || ''
-    const novelConfigFacts = {
-      ...novelConfig,
-      globalGuidance: undefined,
-      writingStyle: undefined,
-    }
+    const { coreOutline, worldSetting, goldenFinger, protagonistProfile } = novelConfig
+    const promptOnlyConfigKeys = new Set([
+      'globalGuidance',
+      'writingStyle',
+      'coreOutline',
+      'worldSetting',
+      'goldenFinger',
+      'protagonistProfile',
+    ])
+    const novelConfigFacts = Object.fromEntries(
+      Object.entries(novelConfig).filter(([key]) => !promptOnlyConfigKeys.has(key)),
+    )
     const novelConfigFactsJson = JSON.stringify(novelConfigFacts, null, 2)
-    let filteredContext = ''
+
+    /**
+     * 作者在本章蓝图页 @ 引用的世界观设定（「本章引用」区）。
+     *
+     * 先生定的路线里，每章只注入三类内容：**作者 @ 引用的** + AI 自己检索到的 + 知识库 topK。
+     * 知识库那一路在下面已接好，这里补上「作者 @ 引用的」这一路 ——
+     * 此前 chapter_world_settings 表、IPC、store、UI 都已齐备，只差这一处消费方。
+     *
+     * 两道路径读取：先取本章引用的 id 列表，再取设定条目，按 id 匹配。
+     * 不依赖渲染层 store：store 只在设定面板挂载时才加载，工作流不能假设它已被填充。
+     */
+    let chapterWorldSettingReferences: ChapterMaterialReference[] = []
+    try {
+      // ⚠️ 这里**不能**用 invokeWithProjectSession：`world-setting:*` 不在 ipc-client 的
+      // 项目会话通道清单里（它不借用会话身份，而是靠显式传入的 expectedProjectPath，
+      // 由主进程 guardProject 校验）。用错会立刻抛「通道不属于项目会话范围」，
+      // 而那段异常又会被下面的 catch 吞掉 —— 表现就是「引用的设定静默没进提示词」。
+      const refs = await ipc.invoke(
+        'world-setting:list-chapter-refs',
+        this.chapterInfo.chapterNumber,
+        expectedProjectPath,
+      )
+      if (Array.isArray(refs) && refs.length > 0) {
+        const entries = await ipc.invoke('world-setting:list', expectedProjectPath)
+        if (Array.isArray(entries)) {
+          const byId = new Map<number, WorldSettingEntry>()
+          for (const entry of entries) {
+            if (entry && typeof entry === 'object' && typeof entry.id === 'number') byId.set(entry.id, entry)
+          }
+          // 按作者在引用区里的排列顺序取，保持可控、可预期。
+          const referenced = refs
+            .map(ref => (ref && typeof ref === 'object' && typeof ref.settingId === 'number'
+              ? byId.get(ref.settingId)
+              : undefined))
+            .filter((entry): entry is WorldSettingEntry => Boolean(entry))
+            // 闸门：pending 候选绝不进上下文 —— 那是 AI 或作者还没确认的东西，
+            // 喂进去会让猜测自我强化（这是设定库自建立起就守住的规则）。
+            .filter(entry => entry.status !== 'pending')
+
+          const blocks: string[] = []
+          let usedChars = 0
+          for (const entry of referenced) {
+            if (blocks.length >= CHAPTER_WORLD_SETTING_MAX_ENTRIES) break
+            const detail = typeof entry.content === 'string' && entry.content.trim().length > 0
+              && entry.content.trim().length <= CHAPTER_WORLD_SETTING_CONTENT_MAX_CHARS
+              ? entry.content.trim()
+              : (entry.summary ?? '').trim()
+            if (!detail) continue
+            const name = entry.name.trim()
+            if (!name || !detail) continue
+            const block = `- ${name}：${detail}`
+            if (usedChars + block.length > CHAPTER_WORLD_SETTING_TOTAL_MAX_CHARS) break
+            blocks.push(block)
+            usedChars += block.length
+          }
+
+          if (blocks.length > 0) {
+            const header = promptLanguageText(
+              writingLanguage,
+              '【作者为本章引用的世界观设定（优先于既往正文；与作者原文冲突时以作者原文为准）】',
+              '[World-setting entries the author referenced for this chapter (take precedence over earlier prose; the author\'s own text wins on conflict)]',
+            )
+            const body = `${header}\n${blocks.join('\n')}`
+            chapterWorldSettingReferences = [{ text: body, rendered: body }]
+            callbacks.log(uiText(
+              `  已注入本章引用的设定 ${blocks.length} 条`,
+              `  Injected ${blocks.length} referenced world-setting entry(ies) for this chapter`,
+            ))
+          }
+        }
+      }
+    } catch (error) {
+      // 读取失败按「本章没有引用」处理，绝不打断生成 —— 但**不静默**：
+      // 这条链路一旦出问题，作者只会看到「引用的设定没进提示词」这种无从下手的现象，
+      // 所以要在日志里留下确切原因（不抛错、不阻断）。
+      callbacks.log(uiText(
+        `  读取本章引用的世界观设定失败，已跳过：${error instanceof Error ? error.message : String(error)}`,
+        `  Could not read this chapter's referenced world settings; skipped: ${error instanceof Error ? error.message : String(error)}`,
+      ))
+    }
+
+    let knowledgeReferences: ChapterMaterialReference[] = []
     try {
       callbacks.log(uiText(
         '  检索知识库相关片段...',
@@ -405,27 +624,39 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
         5,
         expectedProjectPath,
       ))
-      filteredContext = results.length > 0
-        ? results.map((r: { fileName: string; score: number; text: string }, i: number) => promptLanguageText(
+      if (results.length > 0) {
+        knowledgeReferences = results.map((result: { fileName: string; score: number; text: string }, index: number) => ({
+          text: result.text,
+          rendered: promptLanguageText(
             writingLanguage,
-            `[${i + 1}] (${r.fileName}, 相关度 ${(r.score * 100).toFixed(0)}%)\n${r.text}`,
-            `[${i + 1}] (${r.fileName}, relevance ${(r.score * 100).toFixed(0)}%)\n${r.text}`,
-          )).join('\n\n')
-        : promptLanguageText(writingLanguage, '（知识库中无相关内容）', '(no relevant knowledge-base context)')
+            `[${index + 1}] (${result.fileName}, 相关度 ${(result.score * 100).toFixed(0)}%)\n${result.text}`,
+            `[${index + 1}] (${result.fileName}, relevance ${(result.score * 100).toFixed(0)}%)\n${result.text}`,
+          ),
+          deduplicateAgainstFinalized: true,
+        }))
+      } else {
+        const emptyContext = promptLanguageText(writingLanguage, '（知识库中无相关内容）', '(no relevant knowledge-base context)')
+        knowledgeReferences = [{ text: emptyContext, rendered: emptyContext }]
+      }
     } catch {
-      filteredContext = promptLanguageText(writingLanguage, '（知识库检索不可用）', '(knowledge-base search unavailable)')
+      const unavailableContext = promptLanguageText(writingLanguage, '（知识库检索不可用）', '(knowledge-base search unavailable)')
+      knowledgeReferences = [{ text: unavailableContext, rendered: unavailableContext }]
     }
+    const writerChapterInfo = toWriterChapterInfo(this.chapterInfo)
+    const targetChars = normalizeChapterWordsTarget(this.chapterInfo.wordsTarget, novelConfig.wordsPerChapter)
+    const lowerTargetChars = Math.round(targetChars * 0.8)
+    const upperTargetChars = Math.round(targetChars * 1.2)
     const promptBuilder = new ChapterPromptBuilder(template, writingLanguage)
       // ---- 缓存命中区（跨章稳定，前缀对齐）----
       .withArchitecture(architecture)
       .withGlobalGuidance(mergedGuidance)
       .withWritingStyle(writingStyle)
       .withNovelConfig(novelConfigFactsJson)
-      .withWordNumber(normalizeChapterWordsTarget(this.chapterInfo.wordsTarget, novelConfig.wordsPerChapter))
+      .withWordNumber(targetChars)
       // ---- 章节公共区（首章与后续章都必须完整注入）----
-      .withChapterInfo(this.chapterInfo)
+      .withChapterInfo(writerChapterInfo)
       .withCharacterStates('')
-      .withFutureBlueprints(futureBlueprintsStr)
+      .withFutureBlueprints('')
       .withFilteredContext('')
       .withUserGuidance(this.chapterInfo.userGuidance?.trim() || promptLanguageText(
         writingLanguage,
@@ -433,24 +664,19 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
         '(no author guidance)',
       ))
 
-    let previousEnding = ''
-    let frozenContinuityContext = promptLanguageText(
-      writingLanguage,
-      '（首章无既往定稿连续性）',
-      '(the first chapter has no prior finalized continuity)',
-    )
+    let finalizedSources: FinalizedMaterialSource[] = []
+    let activeThreadContext = ''
     if (!isFirstChapter) {
-      // 从蓝图 JSON 的 notes 字段读取章节要点时间线（按序拼装，利于前缀缓存）
-      const chapterTimeline = await this.readChapterNotesTimeline(
+      const finalized = await this.readFinalizedMaterials(
         expectedProjectPath,
         this.chapterInfo.chapterNumber,
         projectSession,
-        writingLanguage,
         this.chapterInfo.characters,
       )
+      finalizedSources = finalized.sources
       callbacks.log(uiText(
-        `  已加载章节要点与连续性事实（${chapterTimeline.factCount} 条）`,
-        `  Loaded chapter notes and continuity facts (${chapterTimeline.factCount})`,
+        `  已定位定稿连续性原文（${finalized.locatedFactCandidates} 条候选）`,
+        `  Located finalized continuity excerpts (${finalized.locatedFactCandidates} candidates)`,
       ))
       const activeThreads = await this.readActiveNarrativeThreads(
         expectedProjectPath,
@@ -458,44 +684,83 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
         writingLanguage,
       )
       callbacks.log(uiText(
-        `  已加载相关活跃叙事线索（${activeThreads.count} 条）`,
-        `  Loaded relevant active narrative threads (${activeThreads.count})`,
+        `  已加载相关活跃伏笔（${activeThreads.count} 条）`,
+        `  Loaded relevant active foreshadowing (${activeThreads.count})`,
       ))
-      frozenContinuityContext = [chapterTimeline.text, activeThreads.text].filter(Boolean).join('\n\n')
-
-      previousEnding = this.previousDraftEnding ?? ''
-      if (!previousEnding) {
-        try {
-          const prevNum = this.chapterInfo.chapterNumber - 1
-          const meta = await ipc.invokeWithProjectSession(projectSession, 'db:draft-get-finalized', prevNum, expectedProjectPath)
-          if (meta) {
-            const full = await ipc.invokeWithProjectSession(projectSession, 'db:draft-get-full', meta.id, expectedProjectPath)
-            if (full?.content) previousEnding = previousChapterEnding(full.content)
-          }
-        } catch { /* 忽略 */ }
-      }
-
+      activeThreadContext = activeThreads.text
       promptBuilder
-        // ---- 缓存命中区续（要点时间线按序追加，前缀对齐）----
-        .withGlobalSummary([chapterTimeline.text, activeThreads.text].filter(Boolean).join('\n\n'))
-        // ---- 缓存失效区（逐章变化）----
-        .withPreviousEnding(previousEnding || promptLanguageText(
-          writingLanguage,
-          '（无前文）',
-          '(no previous manuscript)',
-        ))
+        // Old summaries, currentState and previous-ending slots stay empty. One
+        // source-labelled material package is appended below.
+        .withGlobalSummary('')
+        .withPreviousEnding('')
         .withShortSummary('')
     }
 
-    const prompt = [
-      promptBuilder.build(),
-      promptLanguageText(
-        writingLanguage,
-        `【冻结的本章相关角色状态】\n${characterState}\n\n【本章相关规划资料（仅作创作参考，不代表已经发生）】\n${filteredContext}`,
-        `[Frozen character states relevant to this chapter]\n${characterState}\n\n[Planning material relevant to this chapter (creative reference only; not established history)]\n${filteredContext}`,
-      ),
-    ].join('\n\n')
-    const targetChars = normalizeChapterWordsTarget(this.chapterInfo.wordsTarget, novelConfig.wordsPerChapter)
+    const selectedCandidateDrafts = this.selectedCandidateDrafts
+      .filter(candidate => candidate.chapterNumber < this.chapterInfo.chapterNumber)
+      .sort((left, right) => left.chapterNumber - right.chapterNumber)
+    const previousChapterNumber = this.chapterInfo.chapterNumber - 1
+    const hasRequiredPreviousCandidate = selectedCandidateDrafts.some(candidate => (
+      candidate.chapterNumber === previousChapterNumber && Boolean(candidate.content.trim())
+    ))
+    const hasRequiredFinalizedSource = finalizedSources.some(source => (
+      source.chapterNumber === previousChapterNumber
+      && source.sourceStatus !== 'invalid'
+      && Boolean(source.content.trim())
+    ))
+    if (!isFirstChapter && !hasRequiredPreviousCandidate && !hasRequiredFinalizedSource) {
+      throw new Error(uiText(
+        `无法固定第 ${previousChapterNumber} 章的必需定稿来源，已停止生成。请修复或重新定稿该章后再试。`,
+        `The required finalized source for Chapter ${previousChapterNumber} could not be fixed, so generation stopped. Repair or re-finalize that chapter and try again.`,
+      ))
+    }
+    const chapterMaterials = assembleChapterMaterials({
+      writingLanguage,
+      authorProjectFacts: [coreOutline, worldSetting, goldenFinger, protagonistProfile]
+        .filter((value): value is string => typeof value === 'string' && Boolean(value.trim())),
+      characterProfiles,
+      futurePlans: futureBlueprintsStr,
+      references: [
+        // 作者的显式引用排在最前：它是最强的意图信号，也必须最不容易被预算挤掉。
+        ...chapterWorldSettingReferences,
+        ...(activeThreadContext ? [{ text: activeThreadContext, rendered: activeThreadContext }] : []),
+        ...knowledgeReferences,
+      ],
+      finalized: finalizedSources,
+      candidates: selectedCandidateDrafts,
+      relevanceTerms: [
+        this.chapterInfo.title,
+        this.chapterInfo.keyEvents,
+        ...this.chapterInfo.characters,
+      ],
+    })
+    if (chapterMaterials.omissions.length > 0) {
+      callbacks.log(uiText(
+        `  可选材料覆盖缺口：${chapterMaterials.omissions.length} 项`,
+        `  Optional material coverage gaps: ${chapterMaterials.omissions.length}`,
+      ))
+    }
+    const chapterLengthContract = promptLanguageText(
+      writingLanguage,
+      `【本章篇幅合同】\n用户目标 ${targetChars} 字；可接受范围 ${lowerTargetChars}–${upperTargetChars} 字（±20%）。在此篇幅内完整落实本章蓝图中的全部作者任务和必需事件；不得为满足篇幅而删除、改写或截断这些要求，不要为凑字数增加无关内容。`,
+      `[Chapter length contract]\nThe user's target is ${targetChars} words; the acceptable range is ${lowerTargetChars}-${upperTargetChars} words (±20%). Within this length, fully realize every author task and required event in the chapter blueprint; do not delete, rewrite, or truncate those requirements to meet the range, and do not add unrelated content just to fill space.`,
+    )
+    const executionItems = [
+      { zhCN: '必需事件', enUS: 'Required events', value: this.chapterInfo.keyEvents },
+      { zhCN: '章节钩子', enUS: 'Chapter hook', value: this.chapterInfo.suspenseHook },
+      { zhCN: '作者本章指导', enUS: 'Author guidance for this chapter', value: this.chapterInfo.userGuidance },
+    ]
+    const chapterExecutionCard = executionItems.some(item => item.value?.trim())
+      ? promptLanguageText(
+          writingLanguage,
+          `【本章执行卡（作者原文重列）】\n以下非空项是当前章应落实的动作和收束，不是新增事实。请在输出前核对各项已通过正文动作或结果落实；后一项动作必须承接正文实际形成的物品持有、人物知情和计划完成状态。\n${executionItems.flatMap(item => item.value?.trim() ? [`- ${item.zhCN}: ${item.value}`] : []).join('\n')}`,
+          `[Current-chapter execution card (author text repeated verbatim)]\nThe non-empty items below are current-chapter actions and end states, not new facts. Before output, check that each item is realized through manuscript action or outcome. Each later action must continue from the item ownership, character knowledge, and plan-completion state actually established in the prose.\n${executionItems.flatMap(item => item.value?.trim() ? [`- ${item.enUS}: ${item.value}`] : []).join('\n')}`,
+        )
+      : ''
+    const prompt = [chapterMaterials.text, promptBuilder.build(), chapterExecutionCard, chapterLengthContract]
+      .filter(Boolean)
+      .join('\n\n')
+    const previousEnding = chapterMaterials.previousEnding
 
     callbacks.log(uiText(
       '调用 AI 生成章节草稿...',
@@ -583,14 +848,11 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
             callbacks,
             context,
             systemRole: promptBuilder.getSystemRole(),
-            chapterInfo: this.chapterInfo,
-            futureBlueprints: futureBlueprintsStr,
+            chapterInfo: writerChapterInfo,
             globalGuidance: mergedGuidance,
             writingStyle,
             novelConfigFacts: novelConfigFactsJson,
-            characterState,
-            continuityContext: frozenContinuityContext,
-            relevantReferenceContext: filteredContext,
+            chapterMaterials: chapterMaterials.text,
             writingLanguage,
             reasoning: initialOutcome.receipt.capabilities.reasoning === true,
             onRecoverableCandidate: candidate => { recoverableDraftCandidate = candidate },
@@ -633,12 +895,38 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
         expectedProjectPath,
       )
       this.assertNotCancelled(context)
+      const finalizedDependencies: DraftSourceDependency[] = await Promise.all(
+        chapterMaterials.consumedFinalizedSources.map(async source => source.sourceIdentity?.kind === 'finalized'
+          ? {
+              kind: 'finalized' as const,
+              draftId: source.draftId,
+              chapterNumber: source.chapterNumber,
+              finalizationId: source.sourceIdentity.finalizationId,
+              contentHash: source.sourceIdentity.contentHash,
+            }
+          : {
+              kind: 'legacy-finalized' as const,
+              draftId: source.draftId,
+              chapterNumber: source.chapterNumber,
+              contentHash: await sha256Hex(source.content),
+            }),
+      )
+      const finalizedDraftIds = new Set(finalizedDependencies.map(dependency => dependency.draftId))
+      const candidateDependencies: DraftSourceDependency[] = await Promise.all(
+        selectedCandidateDrafts
+          .filter(candidate => !finalizedDraftIds.has(candidate.draftId))
+          .map(async candidate => ({
+            draftId: candidate.draftId,
+            contentHash: await sha256Hex(candidate.content),
+          })),
+      )
       const createResult = await ipc.invokeWithProjectSession(projectSession, 'db:draft-create', {
         chapterNumber: this.chapterInfo.chapterNumber,
         version: nextVersion,
         source: 'write',
         content: cleanDraftText,
         wordCount: countDraftUnits(cleanDraftText),
+        sourceDependencies: [...candidateDependencies, ...finalizedDependencies],
       }, expectedProjectPath)
       if (!createResult.success || !createResult.id) {
         throw new Error(createResult.error || uiText('章节草稿保存失败', 'Failed to save the chapter draft.'))
@@ -652,6 +940,8 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
       context.data.draft = cleanDraftText
       context.data.draftContent = cleanDraftText
       context.data.draftPath = pseudoPath
+      context.data.draftId = createResult.id
+      context.data.draftVersion = nextVersion
       context.data.chapterNumber = this.chapterInfo.chapterNumber
       context.data.chapterInfo = this.chapterInfo
       context.data.mergedGuidance = mergedGuidance
@@ -763,14 +1053,11 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
     callbacks: CommandExecuteParams['callbacks']
     context: CommandExecuteParams['context']
     systemRole: string
-    chapterInfo: ChapterInfo
-    futureBlueprints: string
+    chapterInfo: WriterChapterInfo
     globalGuidance: string
     writingStyle: string
     novelConfigFacts: string
-    characterState: string
-    continuityContext: string
-    relevantReferenceContext: string
+    chapterMaterials: string
     writingLanguage: WritingLanguage
     reasoning: boolean
     onRecoverableCandidate(candidate: string): void
@@ -836,26 +1123,20 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
 【本章蓝图】
 ${JSON.stringify(params.chapterInfo, null, 2)}
 
-【后续章节大纲预告】
-${params.futureBlueprints}
-
 【全局写作要求】
 ${params.globalGuidance}
 
 【文风要求】
 ${params.writingStyle || '（无）'}
 
+【文风适用边界】
+- 文风仅用于选择表达方式，不是新增事实或事件要求；无需逐条强行兑现。
+- 作者明确事实与指导、实际前文、本章关键因果和本章篇幅优先。不得用文风改写这些内容或仅为兑现文风增加场景、动作或事件；不得把作者明确事实或要求降格为推测。
+
 【小说配置事实】
 ${params.novelConfigFacts}
 
-【冻结的相关角色状态】
-${params.characterState}
-
-【冻结的已定稿连续性与活跃线索】
-${params.continuityContext}
-
-【冻结的本章相关规划资料（仅作参考，不代表已经发生）】
-${params.relevantReferenceContext}
+${params.chapterMaterials}
 
 【已写正文末尾】
 ${visibleTail}`,
@@ -872,26 +1153,20 @@ ${visibleTail}`,
 [Current chapter blueprint]
 ${JSON.stringify(params.chapterInfo, null, 2)}
 
-[Upcoming chapter blueprints]
-${params.futureBlueprints}
-
 [Project-wide writing guidance]
 ${params.globalGuidance}
 
 [Writing style]
 ${params.writingStyle || '(none)'}
 
+[Writing-style applicability]
+- Writing style selects expression only; it adds no facts or events, and not every item must be forced into the manuscript.
+- Explicit author facts and guidance, actual prior prose, the chapter's key causality, and its target length take priority. Do not use style guidance to rewrite them, relabel explicit author facts or requirements as guesses, or add scenes, actions, or events merely to satisfy style guidance.
+
 [Novel configuration facts]
 ${params.novelConfigFacts}
 
-[Frozen relevant character states]
-${params.characterState}
-
-[Frozen finalized continuity and active threads]
-${params.continuityContext}
-
-[Frozen planning material relevant to this chapter (reference only; not established history)]
-${params.relevantReferenceContext}
+${params.chapterMaterials}
 
 [End of existing manuscript]
 ${visibleTail}`,
@@ -1014,14 +1289,25 @@ ${visibleTail}`,
   }
 
   // --- 抽取自原文件的辅助方法 ---
-  private async readArchitecture(projectPath: string, projectSession: ProjectSessionContext): Promise<string> {
+  private async readArchitecture(
+    projectPath: string,
+    projectSession: ProjectSessionContext,
+    chapterNumber: number,
+    authoredConfigFacts: readonly string[],
+  ): Promise<string> {
     const core = await ipc.invokeWithProjectSession(projectSession, 'db:project-core-get', projectPath)
+    const duplicates = exactParagraphs(authoredConfigFacts)
     const parts: string[] = []
-    if (core?.premise) parts.push(core.premise.trim())
-    if (core?.charactersArch) parts.push(core.charactersArch.trim())
-    if (core?.worldbuilding) parts.push(core.worldbuilding.trim())
-    if (core?.synopsis) parts.push(core.synopsis.trim())
-    return parts.join('\n\n---\n\n')
+    if (core?.premise) parts.push(withoutExactParagraphDuplicates(core.premise, duplicates))
+    if (core?.worldbuilding) parts.push(withoutExactParagraphDuplicates(core.worldbuilding, duplicates))
+    if (core?.synopsis) {
+      // 只带本章段落：大纲里其余章节既不进上下文，也不会被模型当成"已发生"。
+      parts.push(withoutExactParagraphDuplicates(
+        synopsisForDraftChapter(core.synopsis, chapterNumber),
+        duplicates,
+      ))
+    }
+    return parts.filter(Boolean).join('\n\n---\n\n')
   }
 
   private async readProjectPrompts(
@@ -1053,64 +1339,77 @@ ${visibleTail}`,
     } catch { return '' }
   }
 
-  private async readCharacterStates(
+  private async readCharacterProfiles(
     projectPath: string,
     projectSession: ProjectSessionContext,
     writingLanguage: WritingLanguage,
     relevantCharacterNames: readonly string[],
   ): Promise<string> {
     try {
-      const allChars = await ipc.invokeWithProjectSession(projectSession, 'db:character-get-all', projectPath)
-      const states: string[] = []
+      const roster = await ipc.invokeWithProjectSession(projectSession, 'db:character-roster-read', projectPath)
+      if (roster.status !== 'ready' && roster.status !== 'empty') {
+        return promptLanguageText(
+          writingLanguage,
+          '（角色资料来源未知或待修复；未作为作者事实注入）',
+          '(character-profile provenance is unknown or needs repair; it was not injected as author fact)',
+        )
+      }
+      const profiles: string[] = []
       const relevantNames = new Set(relevantCharacterNames.map(name => name.trim()).filter(Boolean))
-      for (const card of allChars) {
+      for (const card of roster.entries) {
         if (!relevantNames.has(card.name)) continue
-        if (card.name && card.currentState) {
-          const cs = card.currentState
-          states.push(promptLanguageText(
+        const facts = [
+          card.gender && `gender: ${card.gender}`,
+          card.age && `age: ${card.age}`,
+          card.appearance && `appearance: ${card.appearance}`,
+          card.personality && `personality: ${card.personality}`,
+          card.background && `background: ${card.background}`,
+          card.abilities && `abilities: ${card.abilities}`,
+          card.motivation && `motivation: ${card.motivation}`,
+          card.arc && `arc: ${card.arc}`,
+          card.notes && `notes: ${card.notes}`,
+        ].filter(Boolean)
+        for (const relationship of card.relationships ?? []) {
+          const target = relationship.target?.trim()
+          const relation = relationship.relation?.trim()
+          if (target && relation) facts.push(`relationship: ${target} (${relation})`)
+        }
+        // 关系备注是作者事实的一部分（与结构化边并存），正常注入，不再标成
+        // 「来源未知」的降级信息。
+        const relationshipNotes = card.relationshipNotes?.trim()
+        if (relationshipNotes) {
+          facts.push(promptLanguageText(
             writingLanguage,
-            `${card.name}（${card.role || '未知'}）| `
-              + `境界：${cs.powerLevel || '未知'} | `
-              + `位置：${cs.location || '未知'} | `
-              + `身体：${cs.physicalState || '正常'} | `
-              + `心理：${cs.mentalState || '正常'} | `
-              + `道具：${cs.keyItems || '无'} | `
-              + `最近：第${cs.updatedAtChapter || 0}章 ${cs.recentEvents || ''}`,
-            `${card.name} (${card.role || 'unknown'}) | `
-              + `power: ${cs.powerLevel || 'unknown'} | `
-              + `location: ${cs.location || 'unknown'} | `
-              + `physical: ${cs.physicalState || 'normal'} | `
-              + `mental: ${cs.mentalState || 'normal'} | `
-              + `key items: ${cs.keyItems || 'none'} | `
-              + `recent: chapter ${cs.updatedAtChapter || 0} ${cs.recentEvents || ''}`,
+            `relationship notes: ${relationshipNotes}`,
+            `relationship notes: ${relationshipNotes}`,
           ))
         }
+        for (const field of CHARACTER_STATE_TEXT_FIELDS) {
+          const provenance = card.currentState?.provenance?.[field]
+          const value = card.currentState?.[field]?.trim()
+          if (provenance?.kind === 'author' && value) {
+            facts.push(`${field}@chapter${provenance.chapterNumber}: ${value}`)
+          }
+        }
+        profiles.push(`${card.name} (${card.role || 'unknown'})${facts.length ? ` | ${facts.join(' | ')}` : ''}`)
       }
-      return states.length > 0
-        ? promptLanguageText(writingLanguage, `【角色状态档案】\n${states.join('\n')}`, `[Character state records]\n${states.join('\n')}`)
-        : promptLanguageText(writingLanguage, '（暂无角色状态档案）', '(no character state records)')
+      return profiles.length > 0 ? profiles.join('\n') : ''
     } catch {
-      return promptLanguageText(writingLanguage, '（角色状态档案读取失败）', '(character state records unavailable)')
+      return promptLanguageText(
+        writingLanguage,
+        '（角色资料读取失败；未把旧 currentState 或 characters_arch 当作作者事实）',
+        '(character profiles unavailable; legacy currentState and characters_arch were not treated as author facts)',
+      )
     }
   }
 
-  /**
-   * 从 finalized 定稿连续性投影读取章节要点时间线，旧蓝图 notes 仅作兼容回退。
-   * 近 5 章完整收录；更早期仅保留标题行，控制总量 ≤ 3000 字。
-   * 按序拼装保证前缀稳定，最大化 LLM 上下文缓存命中。
-   */
-  private async readChapterNotesTimeline(
+  private async readFinalizedMaterials(
     projectPath: string,
     currentChapter: number,
     projectSession: ProjectSessionContext,
-    writingLanguage: WritingLanguage,
     currentEntities: readonly string[],
-  ): Promise<{ text: string; factCount: number }> {
-    const FULL_WINDOW = 5  // 近 N 章完整收录
-    const MAX_CHARS = 3000 // 总量上限
-    const FACT_BUDGET = 1500
-    const lines: string[] = []
-    const factCandidates: Array<{ text: string; entityRelevant: boolean; sourceChapter: number }> = []
+  ): Promise<{ sources: FinalizedMaterialSource[]; locatedFactCandidates: number }> {
+    const FULL_WINDOW = 5
     let finalizedContinuity: FinalizedContinuityProjection[] = []
     try {
       finalizedContinuity = await ipc.invokeWithProjectSession(
@@ -1119,81 +1418,141 @@ ${visibleTail}`,
         currentChapter,
         projectPath,
       )
-    } catch { /* 兼容未迁移的旧项目，逐章读取蓝图 notes */ }
-    const continuityByChapter = new Map(
-      finalizedContinuity.map(projection => [projection.chapterNumber, projection]),
-    )
+    } catch { /* Optional derived index may be unavailable; finalized prose still loads below. */ }
 
-    for (let i = 1; i < currentChapter; i++) {
+    const selected = finalizedContinuity.flatMap(projection => {
+      const isRecent = projection.chapterNumber >= currentChapter - FULL_WINDOW
+      const factEvidence = (projection.facts ?? []).filter(fact => {
+        const entityRelevant = fact.entities.some(entity => currentEntities.includes(entity))
+          || currentEntities.some(entity => (
+            fact.statement.includes(entity) || fact.evidence.includes(entity)
+          ))
+        return isRecent || entityRelevant
+      }).map(fact => fact.evidence).filter(Boolean)
+      const candidateEvidence = (projection.characterStateCandidates ?? [])
+        .filter(candidate => isRecent || currentEntities.includes(candidate.characterName))
+        .map(candidate => candidate.value || candidate.characterName)
+        .filter(Boolean)
+      const evidence = [...new Set([...factEvidence, ...candidateEvidence])]
+      return evidence.length > 0 ? [{ projection, evidence }] : []
+    }).sort((left, right) => right.projection.chapterNumber - left.projection.chapterNumber).slice(0, 12)
+
+    const sources: FinalizedMaterialSource[] = []
+    for (const { projection, evidence } of selected) {
       try {
-        const projection = continuityByChapter.get(i)
-        const bp = projection
-          ? null
-          : await ipc.invokeWithProjectSession(projectSession, 'db:blueprint-get', i, projectPath)
-        if (!projection && !bp) continue
-        const isRecent = i >= currentChapter - FULL_WINDOW
-        const title = projection?.chapterTitle || bp?.title || ''
-        const notes = projection?.chapterNotes || bp?.notes || ''
-        for (const fact of projection?.facts ?? []) {
-          const entityRelevant = fact.entities.some(entity => currentEntities.includes(entity))
-            || currentEntities.some(entity => (
-              fact.statement.includes(entity) || fact.evidence.includes(entity)
-            ))
-          if (!isRecent && !entityRelevant) continue
-          factCandidates.push({
-            text: promptLanguageText(
-              writingLanguage,
-              `- [${fact.category}] ${fact.statement}（来源第${fact.sourceChapter}章；证据：${fact.evidence}）`,
-              `- [${fact.category}] ${fact.statement} (source: Chapter ${fact.sourceChapter}; evidence: ${fact.evidence})`,
-            ),
-            entityRelevant,
-            sourceChapter: fact.sourceChapter,
-          })
-        }
-
-        if (isRecent && notes.trim()) {
-          // 近 N 章：完整收录要点
-          lines.push(promptLanguageText(
-            writingLanguage,
-            `【第${i}章 ${title}】\n${notes.trim()}`,
-            `[Chapter ${i}: ${title}]\n${notes.trim()}`,
-          ))
-        } else {
-          // 远期章节：仅保留标题行（节省 Token）
-          lines.push(promptLanguageText(
-            writingLanguage,
-            `【第${i}章 ${title}】`,
-            `[Chapter ${i}: ${title}]`,
-          ))
-        }
-      } catch { /* 忽略单章读取失败 */ }
-    }
-
-    const selectedFacts: string[] = []
-    let usedFactChars = 0
-    for (const candidate of factCandidates
-      .sort((a, b) => Number(b.entityRelevant) - Number(a.entityRelevant) || b.sourceChapter - a.sourceChapter)
-      .slice(0, 12)) {
-      const nextLength = candidate.text.length + (selectedFacts.length > 0 ? 1 : 0)
-      if (usedFactChars + nextLength > FACT_BUDGET) continue
-      selectedFacts.push(candidate.text)
-      usedFactChars += nextLength
-    }
-    const factBlock = selectedFacts.length > 0
-      ? promptLanguageText(
-          writingLanguage,
-          `【已定稿连续性事实】\n${selectedFacts.join('\n')}`,
-          `[Finalized continuity facts]\n${selectedFacts.join('\n')}`,
+        const sourceRead = await ipc.invokeWithProjectSession(
+          projectSession,
+          'db:continuity-read-source',
+          projection.draftId,
+          projectPath,
         )
-      : ''
-    const notesBudget = Math.max(MAX_CHARS - factBlock.length - (factBlock ? 2 : 0), 0)
-    const notesText = lines.join('\n\n').slice(-notesBudget)
-    const result = [notesText, factBlock].filter(Boolean).join('\n\n')
-
-    return {
-      text: result || promptLanguageText(writingLanguage, '（无章节要点）', '(no chapter notes)'),
-      factCount: selectedFacts.length,
+        const content = sourceRead.status === 'valid'
+          ? sourceRead.snapshot.content
+          : sourceRead.status === 'legacy'
+            ? sourceRead.content
+            : ''
+        if (projection.chapterNumber === currentChapter - 1 && !content.trim()) continue
+        sources.push({
+          chapterNumber: projection.chapterNumber,
+          draftId: projection.draftId,
+          title: projection.chapterTitle,
+          content,
+          evidence,
+          includeEnding: projection.chapterNumber === currentChapter - 1,
+          sourceStatus: sourceRead.status === 'invalid'
+            ? 'invalid'
+            : sourceRead.status === 'legacy'
+              ? 'legacy'
+              : projection.sourceStatus ?? 'current',
+          ...(sourceRead.status === 'valid'
+            ? {
+                sourceIdentity: {
+                  kind: 'finalized' as const,
+                  finalizationId: sourceRead.snapshot.source.finalizationId,
+                  contentHash: sourceRead.snapshot.source.contentHash,
+                },
+              }
+            : sourceRead.status === 'legacy'
+              ? { sourceIdentity: { kind: 'legacy-finalized' as const } }
+              : {}),
+        })
+      } catch {
+        if (projection.chapterNumber === currentChapter - 1) continue
+        sources.push({
+          chapterNumber: projection.chapterNumber,
+          draftId: projection.draftId,
+          title: projection.chapterTitle,
+          content: '',
+          evidence,
+          includeEnding: projection.chapterNumber === currentChapter - 1,
+          sourceStatus: 'invalid',
+        })
+      }
     }
+
+    if (!sources.some(source => (
+      source.chapterNumber === currentChapter - 1
+      && source.sourceStatus !== 'invalid'
+      && Boolean(source.content.trim())
+    ))) {
+      try {
+        const meta = await ipc.invokeWithProjectSession(
+          projectSession,
+          'db:draft-get-finalized',
+          currentChapter - 1,
+          projectPath,
+        )
+        if (meta) {
+          try {
+            const sourceRead = await ipc.invokeWithProjectSession(
+              projectSession,
+              'db:continuity-read-source',
+              meta.id,
+              projectPath,
+            )
+            sources.push({
+              chapterNumber: currentChapter - 1,
+              draftId: meta.id,
+              title: sourceRead.status === 'valid'
+                ? sourceRead.snapshot.chapterTitle
+                : sourceRead.status === 'legacy'
+                  ? sourceRead.chapterTitle
+                  : meta.chapterTitle ?? '',
+              content: sourceRead.status === 'valid'
+                ? sourceRead.snapshot.content
+                : sourceRead.status === 'legacy'
+                  ? sourceRead.content
+                  : '',
+              evidence: [],
+              includeEnding: true,
+              sourceStatus: sourceRead.status === 'valid' ? 'current' : sourceRead.status,
+              ...(sourceRead.status === 'valid'
+                ? {
+                    sourceIdentity: {
+                      kind: 'finalized' as const,
+                      finalizationId: sourceRead.snapshot.source.finalizationId,
+                      contentHash: sourceRead.snapshot.source.contentHash,
+                    },
+                  }
+                : sourceRead.status === 'legacy'
+                  ? { sourceIdentity: { kind: 'legacy-finalized' as const } }
+                  : {}),
+            })
+          } catch {
+            sources.push({
+              chapterNumber: currentChapter - 1,
+              draftId: meta.id,
+              title: meta.chapterTitle ?? '',
+              content: '',
+              evidence: [],
+              includeEnding: true,
+              sourceStatus: 'invalid',
+            })
+          }
+        }
+      } catch { /* Existing guard owns absence; do not invent a source identity. */ }
+    }
+    return { sources, locatedFactCandidates: selected.reduce((sum, item) => sum + item.evidence.length, 0) }
   }
 
   private async readActiveNarrativeThreads(

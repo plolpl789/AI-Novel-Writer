@@ -22,6 +22,7 @@ import {
 import { Input } from '../ui/Input'
 import { Label } from '../ui/Label'
 import { NativeSelect } from '../ui/NativeSelect'
+import PagePlate from '../layout/v2/magazine/PagePlate'
 import { Textarea } from '../ui/Textarea'
 import { captureProjectSession, isProjectSessionCurrent, isProjectSessionPath } from '../project-session-gate'
 import { useProjectStore } from '../../stores/project-store'
@@ -31,6 +32,7 @@ import { ipc } from '../../services/ipc-client'
 import { requireIpcSuccess } from '../../services/ipc-result'
 import type { ExpectedDraftSource, ModelProfile } from '../../shared/ipc-channels'
 import { resolveWritingLanguage, type WritingLanguage } from '../../shared/writing-language'
+import { parseChapterGoalReview, type ChapterGoalReview } from '../../shared/chapter-goal-review'
 import {
   createHumanConfirmedReviewSnapshot,
   hasIncludedReviewItems,
@@ -44,7 +46,8 @@ import {
 /** 审稿问题条目（JSON 格式） */
 interface ReviewIssue {
   category: string
-  severity: 'error' | 'warning' | 'pass'
+  severity: 'error' | 'warning' | 'pass' | 'unknown'
+  goalId?: string
   description: string
   /** 引用的原文片段（有问题时提供） */
   quote?: string
@@ -54,9 +57,11 @@ interface ReviewIssue {
 
 /** AI 返回的 JSON 审稿结构 */
 interface ReviewJSON {
+  goalReview?: unknown
   items: Array<{
     category: string
     severity: string
+    goalId?: string
     description: string
     quote?: string
     stableFactKey?: string
@@ -96,10 +101,11 @@ interface ConfirmedChecklist {
 
 /** 标准化 severity 值 */
 function normalizeSeverity(raw: string): ReviewIssue['severity'] {
-  const s = raw.toLowerCase().trim()
+  const s = typeof raw === 'string' ? raw.toLowerCase().trim() : ''
   if (s === 'error' || s === 'critical' || s === 'severe') return 'error'
   if (s === 'warning' || s === 'warn' || s === 'minor') return 'warning'
-  return 'pass'
+  if (s === 'pass') return 'pass'
+  return 'unknown'
 }
 
 /** 尝试从文本中提取 JSON（兼容 ```json 包裹） */
@@ -123,7 +129,7 @@ function extractJSON(text: string): string | null {
 }
 
 /** 解析审稿报告（优先 JSON，回退到旧版文本解析） */
-function parseReport(text: string, fallbackCategory: string): { issues: ReviewIssue[]; summary: string } {
+function parseReport(text: string, fallbackCategory: string): { issues: ReviewIssue[]; summary: string; goalReview?: ChapterGoalReview } {
   const jsonStr = extractJSON(text)
   if (jsonStr) {
     try {
@@ -132,6 +138,7 @@ function parseReport(text: string, fallbackCategory: string): { issues: ReviewIs
         const issues: ReviewIssue[] = data.items.map(item => ({
           category: item.category || fallbackCategory,
           severity: normalizeSeverity(item.severity),
+          goalId: item.goalId,
           description: item.description || '',
           quote: item.quote || undefined,
           stableFactKey: item.stableFactKey || undefined,
@@ -139,7 +146,7 @@ function parseReport(text: string, fallbackCategory: string): { issues: ReviewIs
             ? item.sourceChapter
             : undefined,
         }))
-        return { issues, summary: data.summary || '' }
+        return { issues, summary: data.summary || '', goalReview: parseChapterGoalReview(data.goalReview) ?? undefined }
       }
     } catch {
       // JSON 解析失败，回退到文本解析
@@ -207,21 +214,34 @@ const SEVERITY_META: Record<ReviewIssue['severity'], {
   colorClass: string
   bgClass: string
   borderClass: string
+  /** v2 语义档位：底色与描边由 v2-atomic.css 从语义色淡染
+   *  （问题卡片走 .v2-tone-soft、图例小标走 .v2-status-badge）。
+   *  v1 下这两个钩子没有定义，元素仍走上面那套 Tailwind 原色，逐像素不变。 */
+  tone: string
 }> = {
+  unknown: {
+    colorClass: 'text-[var(--color-text-muted)]',
+    bgClass: 'bg-[var(--color-bg-elevated)]',
+    borderClass: 'border-[var(--color-border)]',
+    tone: 'muted',
+  },
   error: {
     colorClass: 'text-[var(--color-error-text)]',
     bgClass: 'bg-red-500/10',
     borderClass: 'border-red-500/30',
+    tone: 'error',
   },
   warning: {
     colorClass: 'text-[var(--color-warning-text)]',
     bgClass: 'bg-yellow-500/10',
     borderClass: 'border-yellow-500/30',
+    tone: 'warning',
   },
   pass: {
     colorClass: 'text-[var(--color-success-text)]',
     bgClass: 'bg-green-500/10',
     borderClass: 'border-green-500/30',
+    tone: 'success',
   },
 }
 
@@ -230,6 +250,12 @@ function severityCopy(
   text: (zhCNText: string, enUSText: string) => string,
 ) {
   switch (severity) {
+    case 'unknown':
+      return {
+        label: text('待核实', 'Needs verification'),
+        actionLabel: text('证据不足，不代表通过；默认不修稿', 'Insufficient evidence; not passed or included by default'),
+        countLabel: text('待核实', 'unverified'),
+      }
     case 'error':
       return {
         label: text('严重问题', 'Critical issue'),
@@ -252,6 +278,7 @@ function severityCopy(
 }
 
 function SeverityIcon({ severity }: { severity: ReviewIssue['severity'] }) {
+  if (severity === 'unknown') return <HelpCircle size={14} className="flex-shrink-0 text-[var(--color-text-muted)]" />
   if (severity === 'error') return <AlertTriangle size={14} className="flex-shrink-0" style={{ color: 'var(--color-error)' }} />
   if (severity === 'warning') return <AlertTriangle size={14} className="flex-shrink-0" style={{ color: 'var(--color-warning)' }} />
   return <CheckCircle size={14} className="flex-shrink-0" style={{ color: 'var(--color-success)' }} />
@@ -300,7 +327,8 @@ function editableItemsFromReview(
     ...(issue.quote ? { quote: issue.quote } : {}),
     ...(issue.stableFactKey ? { stableFactKey: issue.stableFactKey } : {}),
     ...(issue.sourceChapter ? { sourceChapter: issue.sourceChapter } : {}),
-    decision: issue.severity === 'pass' ? 'ignore' : 'apply',
+    ...(issue.goalId ? { goalId: issue.goalId } : {}),
+    decision: !issue.goalId && (issue.severity === 'error' || issue.severity === 'warning') ? 'apply' : 'ignore',
     origin: 'ai',
   }))
 }
@@ -377,6 +405,7 @@ function ReviewReportSession({
   const [showLegend, setShowLegend] = useState(false)
   const sourceReviewId = confirmationSourceReviewId(initialSnapshot, reviewId)
   const summary = initialSnapshot?.summary ?? parsedReport.summary
+  const goalReview = confirmed?.snapshot.goalReview ?? initialSnapshot?.goalReview ?? parsedReport.goalReview
   const canManageChecklist = Boolean(draftPath && chapterDir)
 
   useEffect(() => {
@@ -434,6 +463,7 @@ function ReviewReportSession({
   const errorCount = items.filter((i) => i.severity === 'error').length
   const warningCount = items.filter((i) => i.severity === 'warning').length
   const passCount = items.filter((i) => i.severity === 'pass').length
+  const unknownCount = items.filter((i) => i.severity === 'unknown').length
   const errorCopy = severityCopy('error', text)
   const warningCopy = severityCopy('warning', text)
   const passCopy = severityCopy('pass', text)
@@ -544,8 +574,9 @@ function ReviewReportSession({
         sourceDraft: sourceReview.sourceDraft,
         summary,
         authorGuidance,
+        ...(goalReview ? { goalReview } : {}),
         items: items.map(({
-          category, severity, description, quote, stableFactKey, sourceChapter, decision, origin,
+          category, severity, description, quote, stableFactKey, sourceChapter, goalId, decision, origin,
         }) => ({
           category,
           severity,
@@ -553,6 +584,7 @@ function ReviewReportSession({
           ...(quote?.trim() ? { quote: quote.trim() } : {}),
           ...(stableFactKey ? { stableFactKey } : {}),
           ...(sourceChapter ? { sourceChapter } : {}),
+          ...(goalId ? { goalId } : {}),
           decision,
           origin,
         })),
@@ -738,36 +770,64 @@ function ReviewReportSession({
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="max-w-2xl mx-auto px-6 py-4">
-        {/* 统计栏 */}
-        <div className="flex items-center gap-4 mb-4 pb-3 border-b border-[var(--color-border)]">
-          <h3 className="text-base font-bold text-[var(--color-text)]">{text('审稿报告', 'Review report')}</h3>
-          <div className="flex items-center gap-3 text-xs ml-auto">
-            {errorCount > 0 && (
-              <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-red-500/20 text-[var(--color-error-text)]">
-                <SeverityIcon severity="error" /> {errorCount} {errorCopy.countLabel}
+      {/* 页头统一提到内容区顶层：与其它子菜单同一位置、同一宽度（先生：整整齐齐） */}
+      <div className="pagehead-strip">
+        <PagePlate
+          section="project"
+          /* 读数就是这一页的全部要点：一共查出多少条、其中多少是硬伤。
+             这里不硬塞数据图形 —— 两个数字用文字比画成两根刻线更清楚（图必有义）。 */
+          metric={{
+            label: text('问题', 'ISSUES'),
+            value: String(items.length),
+          }}
+          facts={text(
+            `${errorCount} 处错误 · ${warningCount} 处警告`,
+            `${errorCount} errors · ${warningCount} warnings`,
+          )}
+          kicker={text('REVIEW · 审稿报告', 'REVIEW')}
+          title={text('审稿报告', 'Review report')}
+          description={text(
+            '逐条阅读本次审稿发现的问题，确认要修的部分后据此发起修稿',
+            'Read every reported issue, confirm the ones to fix, then start a revision from them.',
+          )}
+          actions={(
+            <div className="flex items-center gap-3 text-xs">
+              {errorCount > 0 && (
+                <span className="v2-status-badge flex items-center gap-1 px-2 py-0.5 rounded bg-red-500/20 text-[var(--color-error-text)]" data-tone="error">
+                  <SeverityIcon severity="error" /> {errorCount} {errorCopy.countLabel}
+                </span>
+              )}
+              {warningCount > 0 && (
+                <span className="v2-status-badge flex items-center gap-1 px-2 py-0.5 rounded bg-yellow-500/20 text-[var(--color-warning-text)]" data-tone="warning">
+                  <SeverityIcon severity="warning" /> {warningCount} {warningCopy.countLabel}
+                </span>
+              )}
+              {/* 上游 1.1.0：证据不足的审稿项单列「待核实」，既不当作通过，也不默认纳入修稿 */}
+              {unknownCount > 0 && (
+                <span className="v2-status-badge flex items-center gap-1 px-2 py-0.5 rounded text-[var(--color-text-muted)]" data-tone="muted">
+                  <SeverityIcon severity="unknown" /> {unknownCount} {text('待核实', 'unverified')}
+                </span>
+              )}
+              <span className="v2-status-badge flex items-center gap-1 px-2 py-0.5 rounded bg-green-500/20 text-[var(--color-success-text)]" data-tone="success">
+                <SeverityIcon severity="pass" /> {passCount} {passCopy.countLabel}
               </span>
-            )}
-            {warningCount > 0 && (
-              <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-yellow-500/20 text-[var(--color-warning-text)]">
-                <SeverityIcon severity="warning" /> {warningCount} {warningCopy.countLabel}
-              </span>
-            )}
-            <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-green-500/20 text-[var(--color-success-text)]">
-              <SeverityIcon severity="pass" /> {passCount} {passCopy.countLabel}
-            </span>
-            {/* 图例帮助按钮 */}
-            <button
-              className="flex items-center justify-center rounded-full hover:bg-[var(--color-hover)] transition-colors"
-              style={{ width: 22, height: 22 }}
-              onClick={() => setShowLegend(!showLegend)}
-              title={text('颜色说明', 'Color legend')}
-            >
-              <HelpCircle size={14} style={{ color: 'var(--color-text-muted)' }} />
-            </button>
-          </div>
-        </div>
+              {/* 图例帮助按钮 */}
+              <button
+                className="flex items-center justify-center rounded-full hover:bg-[var(--color-hover)] transition-colors"
+                style={{ width: 22, height: 22 }}
+                onClick={() => setShowLegend(!showLegend)}
+                title={text('颜色说明', 'Color legend')}
+              >
+                <HelpCircle size={14} style={{ color: 'var(--color-text-muted)' }} />
+              </button>
+            </div>
+          )}
+        />
+      </div>
 
+      {/* 先生：正文栏里各子菜单的内容宽度统一以「剧情线」计划清单的 mx-auto max-w-5xl 为准；
+          左右内距统一 px-8，才能与上方标头的 32px 左边缘连成一条线 */}
+      <div className="mx-auto max-w-5xl px-8 pb-4">
         {/* 颜色图例说明 */}
         {showLegend && (
           <div
@@ -778,15 +838,18 @@ function ReviewReportSession({
             }}
           >
             <div className="font-medium text-[var(--color-text)] mb-1.5">{text('颜色标记说明', 'Color legend')}</div>
-            {(['error', 'warning', 'pass'] as const).map(sev => {
+            {(['error', 'warning', 'unknown', 'pass'] as const).map(sev => {
               const meta = SEVERITY_META[sev]
               const copy = severityCopy(sev, text)
               return (
                 <div key={sev} className="flex items-center gap-2">
-                  <span className={cn(
-                    'inline-flex items-center gap-1 px-2 py-0.5 rounded',
-                    meta.bgClass, meta.colorClass
-                  )}>
+                  <span
+                    className={cn(
+                      'v2-status-badge inline-flex items-center gap-1 px-2 py-0.5 rounded',
+                      meta.bgClass, meta.colorClass
+                    )}
+                    data-tone={meta.tone}
+                  >
                     <SeverityIcon severity={sev} /> {copy.label}
                   </span>
                   <span style={{ color: 'var(--color-text-secondary)' }}>
@@ -813,11 +876,22 @@ function ReviewReportSession({
           </div>
         )}
 
+        {goalReview && (
+          <p className="mb-4 text-xs text-[var(--color-text-muted)]">
+            {goalReview.coverage === 'complete'
+              ? text('本章目标已逐项检查；覆盖完整不代表全部完成。', 'Chapter goals checked individually; full coverage does not mean all goals are completed.')
+              : goalReview.coverage === 'not_configured'
+                ? text('本章未配置可检查的目标，未进行目标验收。', 'No chapter goals are configured; goal acceptance was not performed.')
+                : text('本章目标检查不完整，尚有待核实项。', 'Chapter goal review is incomplete and needs verification.')}
+          </p>
+        )}
         {/* 分类展示 */}
         {items.length === 0 ? (
           <div className="text-center py-8 text-[var(--color-text-muted)] text-sm">
             <CheckCircle size={32} className="mx-auto mb-2" style={{ color: 'var(--color-success)' }} />
-            {text('审稿通过，未发现问题', 'Review passed. No issues found.')}
+            {goalReview && goalReview.coverage !== 'complete'
+              ? text('暂无已确认的检查结果', 'No confirmed review results yet')
+              : text('审稿通过，未发现问题', 'Review passed. No issues found.')}
           </div>
         ) : (
           <div className="space-y-4">
@@ -832,18 +906,34 @@ function ReviewReportSession({
                     const meta = SEVERITY_META[item.severity]
                     const copy = severityCopy(item.severity, text)
                     const isPass = item.severity === 'pass'
+                    const goal = goalReview?.items.find(goal => goal.id === item.goalId)
                     const isEmptyAuthorIssue = item.origin === 'author' && !item.description.trim()
                     return (
                       <div
                         key={item.id}
                         className={cn(
-                          'px-3 py-2 rounded-md border text-xs leading-relaxed',
+                          'v2-tone-soft px-3 py-2 rounded-md border text-xs leading-relaxed',
                           meta.borderClass, meta.bgClass
                         )}
+                        data-tone={meta.tone}
                       >
                         <div className="flex items-start gap-2">
                           <SeverityIcon severity={item.severity} />
                           <div className="flex-1 min-w-0 space-y-2">
+                            {goal && (
+                              <div className="space-y-1" aria-label={text('本章目标与证据', 'Chapter goal and evidence')}>
+                                <p className="font-medium">
+                                  {text('本章目标：', 'Chapter goal: ')}{goal.text}
+                                  {' — '}{goal.status === 'completed' ? text('已完成', 'Completed') : goal.status === 'unmet' ? text('未完成', 'Unmet') : text('待核实', 'Needs verification')}
+                                </p>
+                                {goal.evidence.map((evidence, index) => (
+                                  <blockquote key={index} className="border-l-2 border-[var(--color-border)] pl-2">
+                                    <Quote size={10} className="inline mr-1" />{evidence.quote}
+                                  </blockquote>
+                                ))}
+                                {goal.evidence.length === 0 && <p>{text('暂无可定位正文证据', 'No locatable chapter evidence')}</p>}
+                              </div>
+                            )}
                             {editingChecklist && !isPass ? (
                               <>
                                 <div className="grid grid-cols-[minmax(0,1fr)_130px] gap-2">
@@ -855,12 +945,17 @@ function ReviewReportSession({
                                   <NativeSelect
                                     aria-label={text('严重程度', 'Severity')}
                                     value={item.severity}
-                                    onChange={(event) => updateItem(item.id, {
-                                      severity: normalizeSeverity(event.target.value),
-                                    })}
+                                    onChange={(event) => {
+                                      const severity = normalizeSeverity(event.target.value)
+                                      updateItem(item.id, {
+                                        severity,
+                                        ...(severity === 'unknown' ? { decision: 'ignore' } : {}),
+                                      })
+                                    }}
                                   >
                                     <option value="error">{text('严重问题', 'Critical issue')}</option>
                                     <option value="warning">{text('改进建议', 'Improvement')}</option>
+                                    <option value="unknown">{text('待核实', 'Needs verification')}</option>
                                   </NativeSelect>
                                 </div>
                                 <Textarea
@@ -928,7 +1023,7 @@ function ReviewReportSession({
                                       : <RotateCcw size={12} />}
                                     {item.decision === 'apply'
                                       ? text('忽略', 'Ignore')
-                                      : text('恢复', 'Restore')}
+                                      : item.goalId || item.severity === 'unknown' ? text('明确纳入修稿', 'Explicitly include in revision') : text('恢复', 'Restore')}
                                   </Button>
                                   {item.origin === 'author' && (
                                     <Button
@@ -977,7 +1072,7 @@ function ReviewReportSession({
               </h4>
               <p className="mt-1 text-xs text-[var(--color-text-muted)]">
                 {editingChecklist
-                  ? text('错误和建议默认纳入；“通过”仅展示，不会成为修稿任务。', 'Issues and suggestions are included by default; passed checks stay visible but are never revision tasks.')
+                  ? text('普通错误和建议默认纳入；本章目标与待核实项默认忽略，只有明确选择才纳入；“通过”仅展示。', 'General issues and suggestions are included by default; chapter goals and unverified items require explicit inclusion; passed checks are display-only.')
                   : text('已保存为新的不可变确认快照；原始 AI 审稿未被修改。', 'Saved as a new immutable confirmation snapshot; the original AI review was not modified.')}
               </p>
             </div>
@@ -1173,7 +1268,11 @@ function ConfirmedRevisionDialog({ snapshot, writingLanguage, onClose, onStart }
     <Dialog open onOpenChange={(open) => {
       if (!open && !starting) onClose()
     }}>
-      <DialogContent className="max-w-[520px]">
+      <DialogContent
+        className="max-w-[520px]"
+        /* 先生：这里带着刚勾好的审稿项，误点蒙版关掉就得重新过一遍清单。 */
+        onPointerDownOutside={(event) => event.preventDefault()}
+      >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Sparkles size={15} className="text-[var(--color-accent)]" />

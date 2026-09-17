@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createHash } from 'node:crypto'
 
 import type { StepCallbacks, WorkflowContext } from '../../../../stores/workflow-store'
 import { useEditorStore } from '../../../../stores/editor-store'
@@ -17,6 +18,7 @@ import { runPostProcessPipeline } from '../../workflow-utils'
 import { createBoundedCompletionError } from '../../bounded-completion'
 import { workflowRuntimeDependencies } from './workflow-generation-runtime.fixture'
 import type { CharacterRosterEntry } from '../../../../shared/character-roster'
+import type { FinalizedSourceIdentity } from '../../../../shared/finalized-continuity'
 
 class RefineDraftCommand extends RuntimeRefineDraftCommand {
   constructor(...args: ConstructorParameters<typeof RuntimeRefineDraftCommand>) {
@@ -125,6 +127,19 @@ function chapterInfo() {
   }
 }
 
+function finalizedSource(
+  draftId: number,
+  chapterNumber: number,
+  content: string,
+): FinalizedSourceIdentity {
+  return {
+    draftId,
+    finalizationId: `finalization-${draftId}`,
+    chapterNumber,
+    contentHash: createHash('sha256').update(content, 'utf8').digest('hex'),
+  }
+}
+
 function stubLlm(command: object, response: string): void {
   const target = command as {
     callLLMWithBuilder: () => Promise<string>
@@ -181,6 +196,10 @@ describe('workflow mutation failure boundaries', () => {
       if (channel === 'db:character-roster-read') {
         return { status: 'empty', revision: 0, entries: [] }
       }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -218,6 +237,162 @@ describe('workflow mutation failure boundaries', () => {
     expect(observedMessages[1]?.[0]?.content).toContain('You maintain rigorous character records')
     expect(observedMessages[1]?.[1]?.content).toContain('Existing character records')
     expect(observedMessages[1]?.[1]?.content).not.toContain('【任务要求】')
+  })
+
+  it.each([5, 10])('keeps author writing style unchanged after Chapter %i post-processing', async chapterNumber => {
+    const project = useProjectStore.getState().currentProject!
+    useProjectStore.setState({
+      currentProject: {
+        ...project,
+        novelConfig: { ...project.novelConfig, writingStyle: '作者手工文风' },
+      },
+    })
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'kb:import-text') return { success: true, chunkCount: 1 }
+      if (channel === 'db:blueprint-update-notes') return { success: true }
+      if (channel === 'db:character-roster-read') return { status: 'empty', revision: 0, entries: [] }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
+      throw new Error(`unexpected IPC: ${channel}`)
+    })
+    stubVelaIpc(invoke)
+    const complete = vi.fn(async (
+      _builder: { build: () => string; getSystemRole: () => string },
+      _callbacks: StepCallbacks,
+      output: 'visible-text' | 'structured-data',
+    ) => output === 'structured-data' ? '{"updates":[]}' : '本章剧情要点')
+    const steps = buildFinalizePostProcessSteps(
+      { path: PROJECT_PATH },
+      chapterNumber,
+      `第${chapterNumber}章`,
+      '定稿正文',
+      { complete },
+    )
+
+    for (const step of steps) await step.executor(callbacks(), context())
+
+    // world_settings 是定稿后处理新增的一步（把本章的世界观进展落袋 + 沉淀新设定）。
+    // 本用例的 IPC mock 让 list-chapter-refs / list 都返回空数组，
+    // 所以这一步不会写入任何东西（没有引用条目、也没有新实体建议）。
+    expect(steps.map(step => step.key)).toEqual(['kb_import', 'chapter_notes', 'character_cards', 'world_settings'])
+    // 3 次：章节要点 + 角色状态 + 世界观落袋（每步各一次 LLM 调用）。
+    expect(complete).toHaveBeenCalledTimes(3)
+    expect(invoke.mock.calls.map(([channel]) => channel)).toEqual(expect.arrayContaining([
+      'kb:import-text',
+      'db:blueprint-update-notes',
+      'db:character-roster-read',
+    ]))
+    expect(invoke.mock.calls.map(([channel]) => channel)).not.toContain('db:project-core-update')
+    expect(useProjectStore.getState().currentProject?.novelConfig.writingStyle).toBe('作者手工文风')
+  })
+
+  it('turns an unmatched world-setting update into a pending candidate instead of dropping it', async () => {
+    let savedDraft: Record<string, unknown> | undefined
+    const invoke = vi.fn(async (channel: string, ...args: unknown[]) => {
+      if (channel === 'kb:import-text') return { success: true, chunkCount: 1 }
+      if (channel === 'db:blueprint-update-notes') return { success: true }
+      if (channel === 'db:character-roster-read') return { status: 'empty', revision: 0, entries: [] }
+      // 第 1 章的真实形态：本章没有声明引用任何设定，设定库也还是空的。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
+      if (channel === 'world-setting:save') {
+        savedDraft = args[0] as Record<string, unknown>
+        return { id: 11, name: '变身' }
+      }
+      throw new Error(`unexpected IPC: ${channel}`)
+    })
+    stubVelaIpc(invoke)
+    const complete = vi.fn(async (
+      _builder: { build: () => string; getSystemRole: () => string },
+      _callbacks: StepCallbacks,
+      output: 'visible-text' | 'structured-data',
+    ) => output === 'structured-data'
+      ? JSON.stringify({
+          updates: [{
+            entryName: '变身',
+            evidence: '看见女人并产生性兴奋，就可能变成该女性。',
+            statement: '男身看见女性产生性兴奋会变成该女性。',
+          }],
+          conflicts: [],
+          newEntities: [],
+        })
+      : '本章剧情要点')
+    const steps = buildFinalizePostProcessSteps(
+      { path: PROJECT_PATH },
+      1,
+      '第1章 一觉醒来变成便利店女店员',
+      '定稿正文',
+      { complete },
+    )
+    const stepCallbacks = callbacks()
+
+    await steps.find(step => step.key === 'world_settings')!.executor(stepCallbacks, context())
+
+    // 库里完全没有「变身」这个名字：它必须降级为待确认候选。
+    // 旧实现只把它记进 unresolvedNames 然后丢弃，于是作者看到「后处理 4/4 成功」，
+    // 待确认队列里却一条都没有。
+    expect(savedDraft).toMatchObject({ name: '变身', status: 'pending', category: 'world' })
+    expect(invoke.mock.calls.map(([channel]) => channel)).not.toContain('world-setting:append-derived')
+    expect(stepCallbacks.log).toHaveBeenCalledWith(expect.stringContaining('1 条新设定待确认'))
+  })
+
+  it('appends a world-setting update to an existing entry the chapter never referenced', async () => {
+    let appendedEntryId: unknown
+    const invoke = vi.fn(async (channel: string, ...args: unknown[]) => {
+      if (channel === 'kb:import-text') return { success: true, chunkCount: 1 }
+      if (channel === 'db:blueprint-update-notes') return { success: true }
+      if (channel === 'db:character-roster-read') return { status: 'empty', revision: 0, entries: [] }
+      // 本章依然没有引用任何条目，但库里已经有「变身」—— 正文的进展必须能落到它身上。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') {
+        return [{
+          id: 7,
+          name: '变身',
+          aliases: [],
+          summary: '男身触碰女性会变身',
+          content: '旧内容',
+          status: 'confirmed',
+        }]
+      }
+      if (channel === 'world-setting:append-derived') {
+        appendedEntryId = args[0]
+        return { appended: true }
+      }
+      throw new Error(`unexpected IPC: ${channel}`)
+    })
+    stubVelaIpc(invoke)
+    const complete = vi.fn(async (
+      _builder: { build: () => string; getSystemRole: () => string },
+      _callbacks: StepCallbacks,
+      output: 'visible-text' | 'structured-data',
+    ) => output === 'structured-data'
+      ? JSON.stringify({
+          updates: [{
+            entryName: '变身',
+            evidence: '看见女人并产生性兴奋，就可能变成该女性。',
+            statement: '男身看见女性产生性兴奋会变成该女性。',
+          }],
+          conflicts: [],
+          newEntities: [],
+        })
+      : '本章剧情要点')
+    const steps = buildFinalizePostProcessSteps(
+      { path: PROJECT_PATH },
+      1,
+      '第1章 一觉醒来变成便利店女店员',
+      '定稿正文',
+      { complete },
+    )
+    const stepCallbacks = callbacks()
+
+    await steps.find(step => step.key === 'world_settings')!.executor(stepCallbacks, context())
+
+    // 旧实现只在「本章引用」的条目里解析名字，没引用就必然匹配失败并丢弃进展。
+    expect(appendedEntryId).toBe(7)
+    expect(invoke.mock.calls.map(([channel]) => channel)).not.toContain('world-setting:save')
+    expect(stepCallbacks.log).toHaveBeenCalledWith(expect.stringContaining('1 条已更新'))
   })
 
   it('treats committed-but-pending manuscript publication as a failed finalization step', async () => {
@@ -265,6 +440,10 @@ describe('workflow mutation failure boundaries', () => {
   it('rejects an architecture checkpoint write reported as success=false', async () => {
     const invoke = vi.fn(async (channel: string) => {
       if (channel === 'fs:write-json') return { success: false, error: 'checkpoint rejected' }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -284,6 +463,10 @@ describe('workflow mutation failure boundaries', () => {
   ])('uses the explicit architecture checkpoint fallback when IPC omits an error: %s', async (operationLabel, fallbackMessage) => {
     const invoke = vi.fn(async (channel: string) => {
       if (channel === 'fs:write-json') return { success: false }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -341,6 +524,10 @@ describe('workflow mutation failure boundaries', () => {
       if (channel === 'db:blueprint-update-notes') {
         return { success: false, error: 'notes rejected' }
       }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -375,6 +562,10 @@ describe('workflow mutation failure boundaries', () => {
           ? { success: false, error: 'transient notes failure' }
           : { success: true }
       }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -394,6 +585,10 @@ describe('workflow mutation failure boundaries', () => {
     const invoke = vi.fn(async (channel: string) => {
       if (channel === 'db:continuity-save-finalized') return { success: true }
       if (channel === 'db:blueprint-update-notes') return { success: true, updated: false }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -411,6 +606,10 @@ describe('workflow mutation failure boundaries', () => {
       '作者正文',
       testPostProcessGeneration(),
       41,
+      [],
+      'zh-CN',
+      finalizedSource(41, 1, '作者正文'),
+      7,
     ).find(candidate => candidate.key === 'chapter_notes')
 
     const stepCallbacks = callbacks()
@@ -422,6 +621,8 @@ describe('workflow mutation failure boundaries', () => {
         chapterNumber: 1,
         chapterNotes: '作者原稿的连续性事实',
         facts: [],
+        projectionGeneration: 7,
+        source: finalizedSource(41, 1, '作者正文'),
       },
       PROJECT_PATH,
       expect.objectContaining({ projectId: 'A', leaseId: 'lease-A' }),
@@ -437,6 +638,10 @@ describe('workflow mutation failure boundaries', () => {
       if (channel === 'db:finalization-link-knowledge-document') {
         return { success: true, finalization: { knowledgeDocumentId: 'knowledge-document-41' } }
       }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -466,6 +671,10 @@ describe('workflow mutation failure boundaries', () => {
       if (channel === 'kb:import-text') {
         return { success: true, docId: 'knowledge-document-utf8', chunkCount: 1 }
       }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -532,7 +741,11 @@ describe('workflow mutation failure boundaries', () => {
         case 'db:blueprint-update-notes':
           return { success: true }
         default:
-          throw new Error(`unexpected IPC: ${channel}`)
+          // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
+      throw new Error(`unexpected IPC: ${channel}`)
       }
     })
     stubVelaIpc(invoke)
@@ -614,6 +827,10 @@ describe('workflow mutation failure boundaries', () => {
           entries: [{ name: '林岚', role: 'protagonist', currentState: {} }],
         }
       }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -647,6 +864,10 @@ describe('workflow mutation failure boundaries', () => {
           entries: [{ name: '林岚', role: 'protagonist', currentState: {} }],
         }
       }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -703,6 +924,10 @@ describe('workflow mutation failure boundaries', () => {
       if (channel === 'db:character-roster-read') {
         return { status: 'empty', revision: 0, entries: [] }
       }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -738,6 +963,10 @@ describe('workflow mutation failure boundaries', () => {
       if (channel === 'db:character-roster-read') {
         return { status: 'ready', revision: 4, entries: [{ name: '林岚', role: 'protagonist' }] }
       }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -759,6 +988,10 @@ describe('workflow mutation failure boundaries', () => {
       if (channel === 'db:character-roster-read') {
         return { status: 'ready', revision: 4, entries: [{ name: '林岚', role: 'protagonist' }] }
       }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -798,6 +1031,7 @@ describe('workflow mutation failure boundaries', () => {
       },
     }
     let committedEntries: CharacterRosterEntry[] = []
+    let savedCandidates: unknown[] = []
     const invoke = vi.fn(async (channel: string, request?: unknown) => {
       if (channel === 'db:character-roster-read') {
         return { status: 'ready', revision: 4, entries: [existing] }
@@ -806,6 +1040,14 @@ describe('workflow mutation failure boundaries', () => {
         committedEntries = (request as { entries: CharacterRosterEntry[] }).entries
         return { success: true, receipt: { revision: 5 } }
       }
+      if (channel === 'db:continuity-save-character-state-candidates') {
+        savedCandidates = (request as { candidates: unknown[] }).candidates
+        return { success: true }
+      }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -822,8 +1064,10 @@ describe('workflow mutation failure boundaries', () => {
       })),
     }
     const workflowContext = { ...context(), runId: 'field-semantics' }
+    const sourceReceipt = finalizedSource(42, 2, '正文')
     const step = buildFinalizePostProcessSteps(
-      { path: PROJECT_PATH }, 2, '第二章', '正文', generation,
+      { path: PROJECT_PATH }, 2, '第二章', '正文', generation, 42, [], 'zh-CN',
+      sourceReceipt, 0,
     ).find(candidate => candidate.key === 'character_cards')
 
     await expect(step!.executor(callbacks(), workflowContext)).resolves.toBeUndefined()
@@ -839,8 +1083,16 @@ describe('workflow mutation failure boundaries', () => {
         keyItems: '',
         recentEvents: '发现密信',
         updatedAtChapter: 2,
+        provenance: {
+          location: { kind: 'derived', source: sourceReceipt },
+          keyItems: { kind: 'derived', source: sourceReceipt },
+        },
       },
     })])
+    expect(savedCandidates).toEqual(expect.arrayContaining([
+      { characterName: '林岚', field: 'location', value: '码头' },
+      { characterName: '林岚', field: 'keyItems', value: '' },
+    ]))
   })
 
   it('stops character-card post-processing when its one roster receipt reports failure', async () => {
@@ -856,6 +1108,10 @@ describe('workflow mutation failure boundaries', () => {
       if (channel === 'db:character-roster-commit') {
         return { success: false, error: 'roster receipt rejected' }
       }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -866,12 +1122,17 @@ describe('workflow mutation failure boundaries', () => {
         return 'request-1'
       }),
     })
+    const sourceReceipt = finalizedSource(41, 1, '正文')
     const step = buildFinalizePostProcessSteps(
       { path: PROJECT_PATH },
       1,
       '第一章',
       '正文',
       testPostProcessGeneration(),
+      41,
+      [],
+      'zh-CN',
+      sourceReceipt,
     ).find(candidate => candidate.key === 'character_cards')
     expect(step).toBeDefined()
     const stepCallbacks = callbacks()
@@ -883,6 +1144,12 @@ describe('workflow mutation failure boundaries', () => {
       'db:character-roster-read',
       'db:character-roster-commit',
     ])
+    expect(invoke).toHaveBeenCalledWith(
+      'db:character-roster-commit',
+      expect.objectContaining({ source: sourceReceipt }),
+      PROJECT_PATH,
+      expect.objectContaining({ projectId: 'A', leaseId: 'lease-A' }),
+    )
   })
 
   it('reuses generated character state when an executor retry only repairs persistence', async () => {
@@ -898,14 +1165,20 @@ describe('workflow mutation failure boundaries', () => {
           ? { success: false, error: 'transient roster failure' }
           : { success: true, receipt: { revision: 5 } }
       }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
     const complete = vi.fn(async () => JSON.stringify({
       updates: [{ name: '林岚', currentState: { location: '车站' } }],
     }))
+    const sourceReceipt = finalizedSource(41, 1, '正文')
     const step = buildFinalizePostProcessSteps(
-      { path: PROJECT_PATH }, 1, '第一章', '正文', { complete },
+      { path: PROJECT_PATH }, 1, '第一章', '正文', { complete }, 41, [], 'zh-CN',
+      sourceReceipt,
     ).find(candidate => candidate.key === 'character_cards')!
 
     await expect(step.executor(callbacks(), context())).rejects.toThrow('transient roster failure')
@@ -913,6 +1186,12 @@ describe('workflow mutation failure boundaries', () => {
 
     expect(complete).toHaveBeenCalledOnce()
     expect(invoke.mock.calls.filter(([channel]) => channel === 'db:character-roster-commit')).toHaveLength(2)
+    expect(invoke).toHaveBeenCalledWith(
+      'db:character-roster-commit',
+      expect.objectContaining({ source: sourceReceipt }),
+      PROJECT_PATH,
+      expect.objectContaining({ projectId: 'A', leaseId: 'lease-A' }),
+    )
   })
 
   it('regenerates character state after malformed model output fails parsing', async () => {
@@ -924,6 +1203,10 @@ describe('workflow mutation failure boundaries', () => {
       if (channel === 'db:character-roster-commit') {
         return { success: true, receipt: { revision: 5 } }
       }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -932,8 +1215,10 @@ describe('workflow mutation failure boundaries', () => {
       .mockResolvedValueOnce(JSON.stringify({
         updates: [{ name: '林岚', currentState: { location: '车站' } }],
       }))
+    const sourceReceipt = finalizedSource(41, 1, '正文')
     const step = buildFinalizePostProcessSteps(
-      { path: PROJECT_PATH }, 1, '第一章', '正文', { complete },
+      { path: PROJECT_PATH }, 1, '第一章', '正文', { complete }, 41, [], 'zh-CN',
+      sourceReceipt,
     ).find(candidate => candidate.key === 'character_cards')!
 
     await expect(step.executor(callbacks(), context())).rejects.toThrow('updates 必须是列表')
@@ -941,11 +1226,21 @@ describe('workflow mutation failure boundaries', () => {
 
     expect(complete).toHaveBeenCalledTimes(2)
     expect(invoke.mock.calls.filter(([channel]) => channel === 'db:character-roster-commit')).toHaveLength(1)
+    expect(invoke).toHaveBeenCalledWith(
+      'db:character-roster-commit',
+      expect.objectContaining({ source: sourceReceipt }),
+      PROJECT_PATH,
+      expect.objectContaining({ projectId: 'A', leaseId: 'lease-A' }),
+    )
   })
 
   it('does not persist post-process output when the stream omits terminal evidence', async () => {
     const invoke = vi.fn(async (channel: string) => {
       if (channel === 'db:blueprint-update-notes') return { success: true }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -1010,6 +1305,10 @@ describe('workflow mutation failure boundaries', () => {
       if (channel === 'db:revision-create' || channel === 'db:revision-replace-pending') {
         return { success: false, error: 'revision rejected' }
       }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -1024,6 +1323,129 @@ describe('workflow mutation failure boundaries', () => {
     expect(useEditorStore.getState().tabs).toEqual([])
   })
 
+  it.each([true, false, 'invalid-evidence'] as const)('同一次审稿冻结本章目标，漏项或无效证据不重试（返回到期目标：%s）', async (includeDueGoal) => {
+    const blueprint = {
+      chapterNumber: 1, title: '相册', role: '发展', purpose: '缓和关系',
+      keyEvents: '完成相册；约定周三搬设备', characters: [], suspenseHook: '', userGuidance: '', notes: '', notesUpdatedAt: '',
+    }
+    const draft = '她说，明天再装订相册。两人约定周三搬设备。'
+    let saved: Record<string, unknown> = {}
+    const invoke = vi.fn(async (channel: string, ...args: unknown[]) => {
+      if (channel === 'db:continuity-list-before' || channel === 'db:character-get-all') return []
+      if (channel === 'db:project-core-get') return {}
+      if (channel === 'db:blueprint-get-all') return [blueprint, { ...blueprint, chapterNumber: 2, keyEvents: '搬运设备' }]
+      if (channel === 'db:blueprint-get') return null
+      if (channel === 'db:draft-get-meta') return { id: 1, chapterNumber: 1, version: 1, status: 'draft', source: 'write' }
+      if (channel === 'db:review-create') {
+        saved = JSON.parse((args[0] as { content: string }).content)
+        return { success: true, id: 9 }
+      }
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
+      throw new Error(`unexpected IPC: ${channel}`)
+    })
+    stubVelaIpc(invoke)
+    let prompt = ''
+    const generateStream = vi.fn(async (messages, streamCallbacks) => {
+      prompt = messages.map((message: { content: string }) => message.content).join('\n')
+      // A late editor change must not replace the checklist sent with this draft.
+      blueprint.keyEvents = '仅准备相册'
+      streamCallbacks.onDone?.(JSON.stringify({
+        summary: '全部通过',
+        items: [{ category: '连续性', severity: 'pass', description: '未发现其他冲突。' }],
+        goalReviews: [
+          ...(includeDueGoal ? [{ id: 'ch1:keyEvents:1', status: 'unmet', description: '本章要求完成，相册装订却延期。', evidence: [{ quote: includeDueGoal === 'invalid-evidence' ? '正文不存在的引文' : '明天再装订相册' }] }] : []),
+          { id: 'ch1:keyEvents:2', status: 'completed', description: '约定已达成，无需本章提前搬设备。', evidence: [{ quote: '两人约定周三搬设备。' }] },
+        ],
+      }), undefined, 'stop')
+      return 'single-review-request'
+    })
+    useLLMStore.setState({ defaultModelId: 'model', generateStream })
+    await new ReviewChapterCommand({ draftPath: 'vela://draft/1', draftContent: draft, chapterNumber: 1 })
+      .execute({ step: {}, context: context(), callbacks: callbacks() })
+    expect(generateStream).toHaveBeenCalledTimes(1)
+    expect(prompt).toContain('ch1:keyEvents:1')
+    expect(prompt).not.toContain('ch2:keyEvents:1')
+    expect(saved.summary).not.toBe('全部通过')
+    expect(saved.goalReview).toMatchObject({ items: [
+      { id: 'ch1:keyEvents:1', text: '完成相册', status: includeDueGoal === true ? 'unmet' : 'unknown' },
+      { id: 'ch1:keyEvents:2', text: '约定周三搬设备', status: 'completed' },
+    ] })
+    expect(saved.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ goalId: 'ch1:keyEvents:1', severity: includeDueGoal === true ? 'error' : 'unknown' }),
+    ]))
+  })
+
+  /**
+   * 先生特别强调「审稿要防误报」。措辞本身就是防线：
+   * 若把设定写成「检查清单」，模型会逐条核对、输出一堆「某条没被违反」的 filler，
+   * 而 items 只有 10 条的共享预算 —— 被挤掉的正是真正的伏笔与连贯性问题。
+   * 所以这里钉住三件事：对照参考定性、双引证要求、pending 不注入。
+   */
+  it('injects referenced world settings as a reference, never as a checklist', async () => {
+    let prompt = ''
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'kb:search') return []
+      if (channel === 'db:character-get-all') return []
+      if (channel === 'db:project-core-get') return {}
+      if (channel === 'db:draft-get-meta') {
+        return { id: 1, chapterNumber: 1, version: 1, status: 'draft', source: 'write' }
+      }
+      if (channel === 'db:review-next-index') return 1
+      if (channel === 'db:review-create') return { success: true, id: 'review-1' }
+      if (channel === 'db:blueprint-get') return null
+      if (channel === 'world-setting:list-chapter-refs') {
+        return [{ chapterNumber: 1, settingId: 11 }, { chapterNumber: 1, settingId: 22 }]
+      }
+      if (channel === 'world-setting:list') {
+        return [
+          { id: 11, name: '青云宗', content: '以灵脉立宗。', summary: '', status: 'confirmed' },
+          // 未确认的候选绝不能当裁判标准
+          { id: 22, name: '待定哨兵', content: 'PENDING_MUST_NOT_JUDGE', summary: '', status: 'pending' },
+        ]
+      }
+      throw new Error(`unexpected IPC: ${channel}`)
+    })
+    stubVelaIpc(invoke)
+    const command = new ReviewChapterCommand({
+      draftPath: 'vela://draft/1',
+      draftContent: '待审正文',
+      chapterNumber: 1,
+    })
+    // 断言类型：流式回调的签名在 store 侧带 TokenUsage/LLMFinishReason 等具体类型，
+    // 本用例只关心「提示词里有什么」，用 as never 跳过 mock 的逆变检查。
+    useLLMStore.setState({
+      defaultModelId: 'model',
+      generateStream: vi.fn(async (
+        messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+        streamCallbacks: { onDone?: (text: string, usage?: unknown, reason?: string) => void },
+      ) => {
+        prompt = messages.map(message => message.content).join('\n')
+        const payload = JSON.stringify({
+          summary: 'ok',
+          items: [{ category: '剧情合理性', severity: 'pass', description: '未发现冲突。' }],
+          goalReviews: [],
+        })
+        // 审稿走的是流式回调：必须结算 onDone，否则命令会一直等下去（本用例曾因此超时）。
+        streamCallbacks.onDone?.(payload, undefined, 'stop')
+        return payload
+      }) as never,
+    })
+
+    await command.execute({ step: {}, context: context(), callbacks: callbacks() })
+
+    expect(prompt).toContain('青云宗')
+    expect(prompt).toContain('对照参考，不是检查清单')
+    // 双引证要求：必须同时引正文原句与被违反的条文
+    expect(prompt).toContain('正文原句')
+    expect(prompt).toContain('所违反的设定条文')
+    // 未被违反就不提、也不新增维度、也不凑 pass
+    expect(prompt).toContain('未被违反就不要提及')
+    expect(prompt).not.toContain('PENDING_MUST_NOT_JUDGE')
+  })
+
   it('does not open a review report when review persistence fails', async () => {
     const invoke = vi.fn(async (channel: string) => {
       if (channel === 'kb:search') return []
@@ -1035,6 +1457,10 @@ describe('workflow mutation failure boundaries', () => {
       if (channel === 'db:review-next-index') return 1
       if (channel === 'db:review-create') return { success: false, error: 'review rejected' }
       if (channel === 'db:blueprint-get') return null
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -1097,6 +1523,10 @@ describe('workflow mutation failure boundaries', () => {
         return { success: true, id: 9 }
       }
       if (channel === 'db:blueprint-get') return null
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -1125,9 +1555,10 @@ describe('workflow mutation failure boundaries', () => {
       summary: string
       items: Array<{ description: string; quote?: string }>
     }
-    expect(Array.from(persisted.summary)).toHaveLength(120)
-    expect(persisted.items.map(item => Array.from(item.description).length)).toEqual([200, 200, 157, 200, 200])
-    expect(persisted.items.map(item => item.quote === undefined ? 0 : Array.from(item.quote).length)).toEqual([154, 147, 0, 0, 69])
+    expect(persisted.summary).toContain('待核实')
+    expect(persisted.items.slice(0, 5).map(item => Array.from(item.description).length)).toEqual([200, 200, 157, 200, 200])
+    expect(persisted.items.slice(0, 5).map(item => item.quote === undefined ? 0 : Array.from(item.quote).length)).toEqual([154, 147, 0, 0, 69])
+    expect(persisted.items[5]).toMatchObject({ severity: 'unknown' })
     expect(useEditorStore.getState().tabs).toHaveLength(1)
     expect(observedReviewPrompt).toContain('全部 items 必须为 1–10 条')
     expect(observedReviewPrompt).toContain('quote 不超过 160 字')
@@ -1160,6 +1591,10 @@ describe('workflow mutation failure boundaries', () => {
         return { success: true, id: 9 }
       }
       if (channel === 'db:blueprint-get') return null
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -1177,7 +1612,8 @@ describe('workflow mutation failure boundaries', () => {
     })).resolves.toBe(response)
 
     const persisted = JSON.parse(persistedContent) as typeof review
-    expect(persisted.items).toHaveLength(4)
+    expect(persisted.items).toHaveLength(5)
+    expect(persisted.items[4]).toMatchObject({ severity: 'unknown' })
     expect(Array.from(persisted.items[1]!.quote!)).toHaveLength(160)
     expect(persisted.items[1]!.quote).toBe('潮'.repeat(160))
   })
@@ -1262,6 +1698,10 @@ describe('workflow mutation failure boundaries', () => {
       }
       if (channel === 'db:review-next-index') return 1
       if (channel === 'db:blueprint-get') return null
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -1276,10 +1716,69 @@ describe('workflow mutation failure boundaries', () => {
       step: {},
       context: { ...context(), uiLocale: 'en-US', writingLanguage: 'en-US' },
       callbacks: callbacks(),
-    })).rejects.toThrow('The AI review response was invalid, so no report was saved.')
+    })).rejects.toThrow('The AI review response was invalid twice')
 
     expect(invoke.mock.calls.map(([channel]) => channel)).not.toContain('db:review-create')
     expect(useEditorStore.getState().tabs).toEqual([])
+  })
+
+  it.each([
+    {
+      name: 'English UI with Chinese writing',
+      uiLocale: 'en-US' as const,
+      writingLanguage: 'zh-CN' as const,
+      response: 'not-json',
+      expectedLog: 'The review result failed validation (the output is not complete JSON (it may be truncated by the model output limit)); requesting one complete replacement...',
+      expectedError: 'The AI review response was invalid twice (the replacement output is still not complete JSON)',
+      expectedPrompt: '上一轮审稿输出未通过合同校验',
+    },
+    {
+      name: 'Chinese UI with English writing',
+      uiLocale: 'zh-CN' as const,
+      writingLanguage: 'en-US' as const,
+      response: '{}',
+      expectedLog: '审稿结果未通过校验（输出不符合审稿报告合同（字段缺失、越界或多余）），正在请求一次完整替代输出...',
+      expectedError: 'AI 返回的审稿结果两次均无效（替代输出仍不符合审稿报告合同）',
+      expectedPrompt: 'The previous review output failed contract validation',
+    },
+  ])('keeps $name diagnostics in the UI language while rebuilding in the writing language', async ({
+    uiLocale,
+    writingLanguage,
+    response,
+    expectedLog,
+    expectedError,
+    expectedPrompt,
+  }) => {
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'kb:search') return []
+      if (channel === 'db:character-get-all') return []
+      if (channel === 'db:project-core-get') return {}
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
+      throw new Error(`unexpected IPC: ${channel}`)
+    })
+    stubVelaIpc(invoke)
+    const command = new ReviewChapterCommand({
+      draftPath: 'vela://draft/1',
+      draftContent: writingLanguage === 'en-US' ? 'Draft awaiting review.' : '待审正文',
+      chapterNumber: 1,
+    })
+    const llm = vi.spyOn(command as unknown as {
+      callLLMWithBoundedCompletion: (...args: unknown[]) => Promise<string>
+    }, 'callLLMWithBoundedCompletion').mockResolvedValue(response)
+    const stepCallbacks = callbacks()
+
+    await expect(command.execute({
+      step: {},
+      context: { ...context(), uiLocale, writingLanguage },
+      callbacks: stepCallbacks,
+    })).rejects.toThrow(expectedError)
+
+    expect(stepCallbacks.log).toHaveBeenCalledWith(expectedLog)
+    expect(llm.mock.calls[1]?.[0]).toContain(expectedPrompt)
+    expect(invoke.mock.calls.map(([channel]) => channel)).not.toContain('db:review-create')
   })
 
   it('replaces one length-truncated review with complete JSON before persistence', async () => {
@@ -1297,6 +1796,10 @@ describe('workflow mutation failure boundaries', () => {
       if (channel === 'db:review-next-index') return 1
       if (channel === 'db:review-create') return { success: true, id: 9 }
       if (channel === 'db:blueprint-get') return null
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -1330,11 +1833,90 @@ describe('workflow mutation failure boundaries', () => {
     expect(invoke.mock.calls.filter(([channel]) => channel === 'db:review-create')).toHaveLength(1)
   })
 
-  it('keeps a twice length-truncated review fail-closed', async () => {
+  it('recovers a stop-reported truncated review with one complete replacement before persistence', async () => {
+    // 模型/网关在输出上限截断时把 finishReason 报成 stop（而非 length）：
+    // 坏 JSON 直接进入解析 → 命令应自动补一次完整替代输出并成功保存。
+    const completeReview = JSON.stringify({
+      items: [{ category: '剧情连贯性', severity: 'pass', description: '未发现矛盾' }],
+      summary: '审稿完成',
+      goalReviews: [{ id: 'ch1:keyEvents:1', status: 'completed', description: '借书已归还。', evidence: [{ quote: '她将借书交还管理员。' }] }],
+    })
+    const originalDraft = '她将借书交还管理员。'
+    const blueprint = { chapterNumber: 1, keyEvents: '归还借书' }
+    let saved: Record<string, unknown> = {}
+    const invoke = vi.fn(async (channel: string, ...args: unknown[]) => {
+      if (channel === 'kb:search') return []
+      if (channel === 'db:character-get-all') return []
+      if (channel === 'db:project-core-get') return {}
+      if (channel === 'db:blueprint-get-all') return [blueprint]
+      if (channel === 'db:draft-get-meta') {
+        return { id: 1, chapterNumber: 1, version: 1, status: 'draft', source: 'write' }
+      }
+      if (channel === 'db:review-next-index') return 1
+      if (channel === 'db:review-create') {
+        saved = JSON.parse((args[0] as { content: string }).content)
+        return { success: true, id: 10 }
+      }
+      if (channel === 'db:blueprint-get') return null
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
+      throw new Error(`unexpected IPC: ${channel}`)
+    })
+    stubVelaIpc(invoke)
+    const rebuildPrompts: string[] = []
+    const generateStream = vi.fn(async (
+      messages: Parameters<ReturnType<typeof useLLMStore.getState>['generateStream']>[0],
+      streamCallbacks: Parameters<ReturnType<typeof useLLMStore.getState>['generateStream']>[1],
+    ) => {
+      const firstAttempt = generateStream.mock.calls.length === 1
+      if (firstAttempt) blueprint.keyEvents = '生成期间外部改写的目标'
+      if (!firstAttempt) {
+        rebuildPrompts.push(messages.map(message => message.content).join('\n'))
+      }
+      streamCallbacks.onDone?.(
+        firstAttempt ? '{"summary":"审稿","items":[' : completeReview,
+        undefined,
+        'stop',
+      )
+      return `review-request-${generateStream.mock.calls.length}`
+    })
+    useLLMStore.setState({ defaultModelId: 'model', generateStream })
+    const command = new ReviewChapterCommand({
+      draftPath: 'vela://draft/1',
+      draftContent: originalDraft,
+      chapterNumber: 1,
+    })
+
+    await expect(command.execute({
+      step: {},
+      context: context(),
+      callbacks: callbacks(),
+    })).resolves.toBe(completeReview)
+
+    expect(generateStream).toHaveBeenCalledTimes(2)
+    expect(rebuildPrompts[0]).toContain('上一轮审稿输出未通过合同校验')
+    expect(rebuildPrompts[0]).toContain('完整审稿 JSON')
+    expect(rebuildPrompts[0]).toContain('根字段为 summary、items、goalReviews')
+    expect(rebuildPrompts[0]).toContain('【本章目标逐项核对｜软件冻结清单】')
+    expect(rebuildPrompts[0]).toContain('归还借书')
+    expect(rebuildPrompts[0]).toContain(originalDraft)
+    expect(rebuildPrompts[0]).not.toContain('生成期间外部改写的目标')
+    expect(saved.goalReview).toMatchObject({ coverage: 'complete', items: [{ text: '归还借书', status: 'completed' }] })
+    expect(saved.items).toHaveLength(2) // 通用项+目标项，只有最终有效响应被归一化一次。
+    expect(invoke.mock.calls.filter(([channel]) => channel === 'db:review-create')).toHaveLength(1)
+  })
+
+  it('keeps a repeatedly length-truncated review fail-closed', async () => {
     const invoke = vi.fn(async (channel: string) => {
       if (channel === 'kb:search') return []
       if (channel === 'db:character-get-all') return []
       if (channel === 'db:project-core-get') return {}
+      // 定稿后处理的世界观落袋步骤：本章没有引用设定，设定库也为空 →
+      // 该步骤不会写入任何东西（新实体建议依赖模型返回，此处返回空数组）。
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
       throw new Error(`unexpected IPC: ${channel}`)
     })
     stubVelaIpc(invoke)
@@ -1356,9 +1938,100 @@ describe('workflow mutation failure boundaries', () => {
       step: {},
       context: { ...context(), uiLocale: 'en-US' },
       callbacks: callbacks(),
-    })).rejects.toThrow('Automatic continuation ran 1 time but the output is still incomplete')
+    })).rejects.toThrow('Automatic continuation ran 2 times but the output is still incomplete')
 
-    expect(generateStream).toHaveBeenCalledTimes(2)
+    // 先生（审稿截断事故）：审稿要用满该模式的续写上限（MAX_STRUCTURED_CONTINUATIONS = 2）
+    // 才放弃 —— 报告字段多、又必须逐项覆盖冻结清单，只续 1 次在小输出上限的模型上不够用。
+    expect(generateStream).toHaveBeenCalledTimes(3)
     expect(invoke.mock.calls.map(([channel]) => channel)).not.toContain('db:review-create')
+  })
+
+  it('batches a long goal checklist and keeps the other batches when one is truncated', async () => {
+    // 先生（审稿截断事故）：清单 9 项 → 拆 3 批分别核对。
+    // 故意让第 2 批被截断：那一批的目标应降级为待人工核实，其余批次照常保存 ——
+    // 一批失败不该废掉整次审稿。
+    const goals = Array.from({ length: 9 }, (_, index) => `目标${index + 1}`)
+    const draft = goals.map(goal => `${goal}完成了。`).join('')
+    const blueprint = { chapterNumber: 1, keyEvents: goals.join('\n') }
+    let saved: Record<string, unknown> = {}
+    const invoke = vi.fn(async (channel: string, ...args: unknown[]) => {
+      if (channel === 'kb:search') return []
+      if (channel === 'db:character-get-all') return []
+      if (channel === 'db:project-core-get') return {}
+      if (channel === 'db:blueprint-get-all') return [blueprint]
+      if (channel === 'db:draft-get-meta') {
+        return { id: 1, chapterNumber: 1, version: 1, status: 'draft', source: 'write' }
+      }
+      if (channel === 'db:review-next-index') return 1
+      if (channel === 'db:review-create') {
+        saved = JSON.parse((args[0] as { content: string }).content)
+        return { success: true, id: 11 }
+      }
+      if (channel === 'db:blueprint-get') return null
+      if (channel === 'world-setting:list-chapter-refs') return []
+      if (channel === 'world-setting:list') return []
+      throw new Error(`unexpected IPC: ${channel}`)
+    })
+    stubVelaIpc(invoke)
+
+    const batchCall = (prompt: string) => prompt.includes('只输出一个 JSON 对象：{"goalReviews"')
+    const generateStream = vi.fn(async (
+      messages: Parameters<ReturnType<typeof useLLMStore.getState>['generateStream']>[0],
+      streamCallbacks: Parameters<ReturnType<typeof useLLMStore.getState>['generateStream']>[1],
+    ) => {
+      const call = generateStream.mock.calls.length
+      const prompt = messages.map(message => message.content).join('\n')
+      if (!batchCall(prompt)) {
+        // 主审稿：分批模式下 goalReviews 必须是空数组。
+        streamCallbacks.onDone?.(JSON.stringify({
+          summary: '审稿完成',
+          items: [{ category: '剧情连贯性', severity: 'pass', description: '未发现矛盾' }],
+          goalReviews: [],
+        }), undefined, 'stop')
+        return `request-${call}`
+      }
+      // 第 2 批（目标4–6）一律截断：初次与随后的续写都截断 → 该批失败降级。
+      if (prompt.includes('"目标4"')) {
+        streamCallbacks.onDone?.('{"goalReviews":[', undefined, 'length')
+        return `request-${call}`
+      }
+      const numbers = goals
+        .map((goal, index) => ({ goal, number: index + 1 }))
+        .filter(({ goal }) => prompt.includes(`"${goal}"`))
+        .map(({ number }) => number)
+      streamCallbacks.onDone?.(JSON.stringify({
+        goalReviews: numbers.map(number => ({
+          id: `ch1:keyEvents:${number}`,
+          status: 'completed',
+          description: `目标${number}已完成。`,
+          evidence: [{ quote: `目标${number}` }],
+        })),
+      }), undefined, 'stop')
+      return `request-${call}`
+    })
+    useLLMStore.setState({ defaultModelId: 'model', generateStream })
+    const command = new ReviewChapterCommand({
+      draftPath: 'vela://draft/1',
+      draftContent: draft,
+      chapterNumber: 1,
+    })
+
+    await command.execute({ step: {}, context: context(), callbacks: callbacks() })
+
+    // 1 次主审稿 + 3 批核对；失败那批含 1 次续写，故共 5 次。
+    expect(generateStream).toHaveBeenCalledTimes(5)
+    expect(invoke.mock.calls.filter(([channel]) => channel === 'db:review-create')).toHaveLength(1)
+
+    const goalReview = saved.goalReview as { coverage: string; items: Array<{ id: string; status: string }> }
+    const statusById = Object.fromEntries(goalReview.items.map(item => [item.id, item.status]))
+    expect(goalReview.items).toHaveLength(9)
+    expect(statusById['ch1:keyEvents:1']).toBe('completed')
+    expect(statusById['ch1:keyEvents:3']).toBe('completed')
+    expect(statusById['ch1:keyEvents:7']).toBe('completed')
+    expect(statusById['ch1:keyEvents:9']).toBe('completed')
+    // 被截断那一批：降级为 unknown（待人工核实），而不是让整次审稿一起作废。
+    expect(statusById['ch1:keyEvents:4']).toBe('unknown')
+    expect(statusById['ch1:keyEvents:5']).toBe('unknown')
+    expect(statusById['ch1:keyEvents:6']).toBe('unknown')
   })
 })

@@ -11,6 +11,7 @@ import type {
   CharacterStateData,
 } from '../../electron/repositories/character-repository'
 import { normalizeCharacterRole } from '../shared/character-role'
+import { characterRosterIdentityKey } from '../shared/character-roster'
 import {
   characterCardFromRosterEntry,
   characterRosterEntriesFromCards,
@@ -58,6 +59,9 @@ function textField(record: Record<string, unknown>, key: string): string {
 function normalizeCharacterState(value: unknown): CharacterCurrentState | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
   const state = value as Record<string, unknown>
+  const provenance = state.provenance && typeof state.provenance === 'object' && !Array.isArray(state.provenance)
+    ? state.provenance as CharacterCurrentState['provenance']
+    : undefined
   return {
     location: textField(state, 'location'),
     powerLevel: textField(state, 'powerLevel'),
@@ -68,6 +72,7 @@ function normalizeCharacterState(value: unknown): CharacterCurrentState | undefi
     updatedAtChapter: Number.isInteger(state.updatedAtChapter) && Number(state.updatedAtChapter) >= 0
       ? Number(state.updatedAtChapter)
       : 0,
+    ...(provenance ? { provenance } : {}),
   }
 }
 
@@ -194,6 +199,8 @@ interface CharacterState {
   reset: () => void
   setSelectedName: (name: string | null) => void
   addCharacter: () => void
+  /** 按给定名字批量新建角色卡（关系文本里提到的未登记角色）。 */
+  addNamedCharacters: (names: readonly string[]) => void
   deleteCharacter: (
     name: string,
     projectPath?: string,
@@ -414,6 +421,47 @@ export const useCharacterStore = create<CharacterState>()((set, get) => ({
     set((s) => ({
       characters: [...s.characters, newCard],
       selectedName: newCard.name,
+    }))
+    persistCharacterDraftLedger(recordProjectEditorEdit(
+      readCharacterDraftLedger(projectKey),
+      projectKey,
+      before,
+      get().characters,
+    ))
+  },
+
+  addNamedCharacters: (names) => {
+    const projectSession = currentCharacterProjectSession()
+    if (!projectSession) return
+    if (
+      characterIdentityMutationInFlight
+      && sameProjectSessionContext(characterIdentityMutationInFlight.projectSession, projectSession)
+    ) return
+    const projectKey = projectSession.projectPath
+    const state = get()
+    if (
+      !sameProjectSessionContext(state.dataProjectSession, projectSession)
+      || state.loadingProjectSession !== null
+      || state.lastError !== null
+    ) return
+    // 与手工新建同一条通道：按名字建卡、去重、跳过已在名单里的名字，并记进
+    // 草稿账本（改动仍由作者按保存落盘）。
+    const existing = new Set(state.characters.map(card => characterRosterIdentityKey(card.name)))
+    const fresh: string[] = []
+    for (const rawName of names) {
+      const name = rawName.trim()
+      if (!name) continue
+      const key = characterRosterIdentityKey(name)
+      if (!key || existing.has(key)) continue
+      existing.add(key)
+      fresh.push(name)
+    }
+    if (fresh.length === 0) return
+    const before = get().characters
+    const newCards: CharacterCard[] = fresh.map(name => ({ ...EMPTY_CARD, name }))
+    set(s => ({
+      characters: [...s.characters, ...newCards],
+      selectedName: newCards[0].name,
     }))
     persistCharacterDraftLedger(recordProjectEditorEdit(
       readCharacterDraftLedger(projectKey),

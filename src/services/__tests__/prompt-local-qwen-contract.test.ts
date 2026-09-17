@@ -1,12 +1,33 @@
 import { describe, expect, it } from 'vitest'
 
-import { ChapterPromptBuilder } from '../prompts/prompt-builder'
+import { ArchitecturePromptBuilder, ChapterPromptBuilder } from '../prompts/prompt-builder'
 import { BUILTIN_PROMPTS, EDITABLE_PROMPT_KEYS, getBuiltinPromptTemplate, getPromptTemplate, renderPrompt } from '../prompt-templates'
 
 const expectedPromptVariables: Record<string, string[]> = {
   assistant_writing_identity: ['mode_instruction'],
   edit_selected_text: ['edit_instruction', 'selected_text'],
   generate_novel_config_field: ['existing_config', 'field_label', 'field_requirements'],
+  // 世界观设定候选生成：变量清单必须与 prompt-templates.ts 里的声明**逐项同序**。
+  world_setting_candidates: [
+    'project_brief',
+    'architecture',
+    'existing_entries',
+    'category_label',
+    'category_description',
+    'category_list',
+    'known_material',
+    'target_count',
+  ],
+  // 世界观设定单条目生成：变量清单同样必须与 prompt-templates.ts 逐项同序。
+  world_setting_entry: [
+    'project_brief',
+    'architecture',
+    'category_label',
+    'category_description',
+    'entry_name',
+    'existing_draft',
+    'sibling_entries',
+  ],
   generate_global_config: ['user_idea', 'number_of_chapters', 'word_number'],
   premise: [
     'genre',
@@ -105,6 +126,8 @@ const expectedPromptVariables: Record<string, string[]> = {
   refine_from_review: ['review_report', 'draft_content', 'global_guidance', 'user_refine_prompt'],
   generate_chapter_notes: ['chapter_content', 'chapter_number', 'chapter_title'],
   update_character_cards: ['chapter_content', 'chapter_number', 'existing_cards_json'],
+  /** 定稿后把本章的世界观进展落袋：三档输出（进展 / 冲突 / 新实体）。 */
+  update_world_settings: ['chapter_content', 'chapter_number', 'referenced_entries_json'],
   infer_novel_config: ['sample_content'],
   extract_initial_characters: ['character_dynamics', 'genre'],
   infer_single_chapter_blueprint: ['chapter_content', 'chapter_number', 'chapter_title', 'novel_config_summary'],
@@ -148,6 +171,15 @@ const expectedJsonFields: Record<string, string[]> = {
     'keyItems',
     'recentEvents',
     'updatedAtChapter',
+  ],
+  update_world_settings: [
+    'updates',
+    'conflicts',
+    'newEntities',
+    'entryName',
+    'evidence',
+    'statement',
+    'name',
   ],
   infer_novel_config: [
     'novelConfig',
@@ -313,6 +345,96 @@ describe('built-in model-neutral prompt contract', () => {
 
       expect(rendered).toContain('不可丢失的架构事实')
       expect(rendered).toContain('不可丢失的作者设定')
+    }
+  })
+
+  it('每个必需创作事实只由内置首章和后续章提示词注入一次', () => {
+    const variables = {
+      architecture: '唯一架构事实甲',
+      novel_config: '唯一配置事实乙',
+      global_summary: '前文进展',
+      character_states: '角色状态',
+      short_summary: '近期摘要',
+      previous_ending: '上一章结尾',
+      chapter_info: '本章蓝图',
+      future_blueprints: '后续蓝图',
+      filtered_context: '知识库',
+      global_guidance: '唯一全局要求丙',
+      word_number: '3000',
+      writing_style: '唯一文风要求丁',
+      user_guidance: '',
+    }
+
+    for (const key of ['first_chapter_draft', 'next_chapter_draft'] as const) {
+      const template = getPromptTemplate(key)!
+      const renderedPrompts = [
+        renderPrompt(template, variables, 'zh-CN'),
+        new ChapterPromptBuilder(template, 'zh-CN')
+          .withArchitecture(variables.architecture)
+          .withNovelConfig(variables.novel_config)
+          .withGlobalSummary(variables.global_summary)
+          .withCharacterStates(variables.character_states)
+          .withShortSummary(variables.short_summary)
+          .withPreviousEnding(variables.previous_ending)
+          .withChapterInfo(variables.chapter_info)
+          .withFutureBlueprints(variables.future_blueprints)
+          .withFilteredContext(variables.filtered_context)
+          .withGlobalGuidance(variables.global_guidance)
+          .withWordNumber(variables.word_number)
+          .withWritingStyle(variables.writing_style)
+          .withUserGuidance(variables.user_guidance)
+          .build(),
+      ]
+
+      for (const rendered of renderedPrompts) {
+        for (const fact of [
+          variables.architecture,
+          variables.novel_config,
+          variables.global_guidance,
+          variables.writing_style,
+        ]) {
+          expect(rendered.split(fact)).toHaveLength(2)
+        }
+      }
+    }
+  })
+
+  it('正文和任务指导算已引用，伪造的自定义后缀不阻止必需事实兜底', () => {
+    const builtin = getBuiltinPromptTemplate('world_building', 'zh-CN')!
+    const custom = {
+      ...builtin,
+      content: '自定义正文引用：{{premise}}',
+      taskGuidance: '自定义任务指导引用：{{core_setting}}',
+      systemSuffix: '伪造后缀引用：{{golden_finger}}',
+    }
+    const variables = {
+      premise: '正文中的唯一故事前提',
+      genre: '兜底中的唯一题材',
+      core_setting: '任务指导中的唯一世界基盘',
+      golden_finger: '兜底中的唯一金手指',
+      protagonist_profile: '兜底中的唯一主角档案',
+      global_guidance: '兜底中的唯一全局要求',
+      step_guidance: '',
+    }
+    const renderedPrompts = [
+      renderPrompt(custom, variables, 'zh-CN'),
+      new ArchitecturePromptBuilder(custom, 'zh-CN')
+        .withCoreSeed(variables.premise)
+        .withGenre(variables.genre)
+        .withCoreSetting(variables.core_setting)
+        .withGoldenFinger(variables.golden_finger)
+        .withProtagonistProfile(variables.protagonist_profile)
+        .withGlobalGuidance(variables.global_guidance)
+        .withStepGuidance(variables.step_guidance)
+        .build(),
+    ]
+
+    for (const rendered of renderedPrompts) {
+      expect(rendered).not.toContain('伪造后缀引用')
+      expect(rendered).toContain('【自定义模板未引用但仍必须遵循的权威项目设定】')
+      for (const fact of Object.values(variables).filter(Boolean)) {
+        expect(rendered.split(fact)).toHaveLength(2)
+      }
     }
   })
 

@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from 'react'
+﻿import { useState, useCallback, useRef, useEffect } from 'react'
 import { Save, RefreshCw, Sparkles, Loader2, AlertTriangle, FileText } from 'lucide-react'
 import { renderIcon } from '../panels/sidebar/sidebar-icons'
 
@@ -7,7 +7,10 @@ import ArchitectureConfirmDialog from '../dialogs/ArchitectureConfirmDialog'
 import { Button } from '../ui/Button'
 import { ipc } from '../../services/ipc-client'
 import { requireIpcSuccess } from '../../services/ipc-result'
-import { parseCoreField } from '../../services/vela-protocol'
+import { CORE_FIELD_MAP, parseCoreField } from '../../services/vela-protocol'
+import { appErrorMessage } from '../../i18n/app-errors'
+import { toast } from '../ui/Toast'
+import { CharacterCardImportButton } from '../characters/CharacterCardImportButton'
 import CodeMirrorEditor from './CodeMirrorEditor'
 import { useProjectStore } from '../../stores/project-store'
 import { useLocaleStore } from '../../stores/locale-store'
@@ -50,6 +53,9 @@ const ARCH_META: Record<ArchStepKey, { iconName: string; label: string; labelEn:
 
 /** 从文件路径推断出 ArchStepKey */
 function detectStepKey(filePath: string): ArchStepKey | null {
+  const field = parseCoreField(filePath)
+  const coreKey = Object.keys(CORE_FIELD_MAP).find(key => CORE_FIELD_MAP[key] === field)
+  if (coreKey) return coreKey as ArchStepKey
   if (filePath.endsWith('premise.md')) return 'premise'
   if (filePath.endsWith('characters.md')) return 'characters'
   if (filePath.endsWith('worldbuilding.md')) return 'worldbuilding'
@@ -175,7 +181,7 @@ function ArchFileViewerSession({
   }, [isCharacterProjection, tabId])
 
   /** 保存（统一走 vela://core/ DB 路径） */
-  const handleSave = useCallback(async (md: string) => {
+  const handleSave = useCallback(async (md: string, propagateFailure = false) => {
     if (isCharacterProjection) return
     const projectSession = captureProjectSession(useProjectStore.getState().currentProject)
     if (!projectSession || !isProjectSessionPath(projectSession, projectKey)) {
@@ -221,6 +227,12 @@ function ArchFileViewerSession({
           useEditorStore.getState().updateTabContent(tabId, currentContentRef.current)
         }
       }
+    } catch (error) {
+      if (isProjectSessionCurrent(projectSession)) {
+        toast.error(appErrorMessage(useLocaleStore.getState().locale, error))
+      }
+      // Exit-save must reject so the caller cannot close an unsaved document.
+      if (propagateFailure) throw error
     } finally {
       if (isProjectSessionCurrent(projectSession)) setSaving(false)
     }
@@ -228,11 +240,14 @@ function ArchFileViewerSession({
 
   useEffect(() => {
     if (isCharacterProjection) return
+    // EditorArea unmounts the inactive tab. The store removes this handler only
+    // when the tab itself closes, so an inactive dirty document can still save
+    // during application exit.
     registerEditorExitSaveHandler({
       tabId,
       type: 'arch-file',
       projectKey,
-      save: () => handleSave(currentContentRef.current),
+      save: () => handleSave(currentContentRef.current, true),
     })
   }, [handleSave, isCharacterProjection, projectKey, tabId])
 
@@ -347,7 +362,11 @@ function ArchFileViewerSession({
   }, [handleReload, loadCharacterRosterStatus, projectKey])
 
   /** 确认后启动架构生成工作流 */
-  const handleConfirm = async (selectedSteps: ArchStepKey[], stepGuidance: Record<string, string>) => {
+  const handleConfirm = async (
+    selectedSteps: ArchStepKey[],
+    stepGuidance: Record<string, string>,
+    synopsisRange?: { from: number; to: number },
+  ) => {
     const projectSession = captureProjectSession(useProjectStore.getState().currentProject)
     if (!projectSession || !isProjectSessionPath(projectSession, projectKey)) {
       throw new Error('项目会话已切换，未启动架构生成')
@@ -357,6 +376,7 @@ function ArchFileViewerSession({
       workflow: 'generate_architecture',
       selectedSteps,
       stepGuidance,
+      synopsisRange,
     }, projectSession)
   }
 
@@ -439,6 +459,9 @@ function ArchFileViewerSession({
 
         {/* 右侧：字数 + 状态 + 操作按钮 */}
         <div className="flex items-center gap-2 flex-shrink-0">
+          {isCharacterProjection && (
+            <CharacterCardImportButton projectKey={projectKey} disabled={!projectMatches} />
+          )}
 
           {/* 字数 */}
           {charCount > 0 && (
@@ -466,17 +489,19 @@ function ArchFileViewerSession({
             <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />
           </Button>
 
-          {/* 保存按钮（有修改时才显示） */}
-          {!isCharacterProjection && isDirty && (
+          {/* 保存按钮
+              先生：按钮常驻 —— 未修改显示「已保存」、改动了显示「保存」。
+              早先是 {isDirty && <按钮>}，一保存按钮就消失，反馈无处可落。 */}
+          {!isCharacterProjection && (
             <Button
               variant="outline"
               size="sm"
               onClick={() => handleSave(currentContentRef.current)}
-              disabled={saving || !projectMatches}
+              disabled={saving || !projectMatches || !isDirty}
               title={text('保存（Cmd+S）', 'Save (Cmd+S)')}
             >
               <Save size={12} />
-              {text('保存', 'Save')}
+              {isDirty ? text('保存', 'Save') : text('已保存', 'Saved')}
             </Button>
           )}
 

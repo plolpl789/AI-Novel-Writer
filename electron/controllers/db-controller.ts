@@ -5,7 +5,11 @@ import { projectAccess } from '../services/project-access'
 import { assertRequiredExpectedProjectPath } from '../utils/project-context'
 
 // 导入所有 Repository
-import { ProjectCoreRepository, ProjectCoreData } from '../repositories/project-core-repository'
+import {
+  ProjectCoreRepository,
+  ProjectCoreData,
+  type ProjectCoreSynopsisCommitRequest,
+} from '../repositories/project-core-repository'
 import { ProjectClearRepository, ProjectClearOptions } from '../repositories/project-clear-repository'
 import {
   BlueprintRepository,
@@ -16,6 +20,7 @@ import { CharacterRepository } from '../repositories/character-repository'
 import { CharacterRosterRepository } from '../repositories/character-roster-repository'
 import type { CharacterRosterCommitRequest } from '../../src/shared/character-roster'
 import { DraftRepository } from '../repositories/draft-repository'
+import type { DraftSourceDependency } from '../../src/shared/draft-source-dependency'
 import { FinalizedDraftImportRepository } from '../repositories/finalized-draft-import-repository'
 import { FinalizationRepository } from '../repositories/finalization-repository'
 import type { FinalizedDraftImportRequest } from '../../src/shared/finalized-draft-import'
@@ -60,6 +65,7 @@ type ProjectDatabaseHandler = (event: unknown, ...args: never[]) => unknown
 const MUTATING_DATABASE_CHANNELS = new Set([
   'db:close',
   'db:project-core-update',
+  'db:project-core-synopsis-commit',
   'db:import-global-facts-commit',
   'db:project-clear-generated-data',
   'db:import-run-prepare-inspection',
@@ -160,6 +166,18 @@ export function registerDatabaseController() {
       console.error('[db:project-core-update] 失败:', err)
       return { success: false, error: String(err) }
     }
+  })
+
+  ipcMain.handle('db:project-core-synopsis-commit', async (
+    _event,
+    request: ProjectCoreSynopsisCommitRequest,
+    expectedProjectPath: string,
+  ) => {
+    assertRequiredExpectedProjectPath(getCurrentProjectPath(), expectedProjectPath)
+    if (!ProjectCoreRepository.commitSynopsis(request)) {
+      return { success: false, error: '项目数据已变化，已拒绝覆盖情节大纲' }
+    }
+    return { success: true }
   })
 
   ipcMain.handle('db:import-global-facts-commit', async (
@@ -618,6 +636,7 @@ export function registerDatabaseController() {
     source: 'write' | 'rewrite'
     content: string
     wordCount: number
+    sourceDependencies?: DraftSourceDependency[]
   }, expectedProjectPath: string) => {
     try {
       assertRequiredExpectedProjectPath(getCurrentProjectPath(), expectedProjectPath)
@@ -688,9 +707,24 @@ export function registerDatabaseController() {
     }
   })
 
+  ipcMain.handle('db:continuity-save-character-state-candidates', async (_event, request, expectedProjectPath: string) => {
+    try {
+      assertRequiredExpectedProjectPath(getCurrentProjectPath(), expectedProjectPath)
+      SummaryRepository.saveFinalizedCharacterStateCandidates(request)
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
   ipcMain.handle('db:continuity-list-before', async (_event, chapterNumber: number, expectedProjectPath: string) => {
     assertRequiredExpectedProjectPath(getCurrentProjectPath(), expectedProjectPath)
     return SummaryRepository.listFinalizedContinuityBefore(chapterNumber)
+  })
+
+  ipcMain.handle('db:continuity-read-source', async (_event, draftId: number, expectedProjectPath: string) => {
+    assertRequiredExpectedProjectPath(getCurrentProjectPath(), expectedProjectPath)
+    return SummaryRepository.readFinalizedSource(draftId)
   })
 
   ipcMain.handle('db:consistency-exemption-list', async (_event, expectedProjectPath: string) => {

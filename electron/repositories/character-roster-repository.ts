@@ -4,6 +4,7 @@ import type BetterSqlite3 from 'better-sqlite3'
 import {
   CHARACTER_ROSTER_ROLES,
   CHARACTER_ROSTER_SCHEMA_VERSION,
+  CHARACTER_STATE_TEXT_FIELDS,
   characterRosterIdentityKey,
   type CharacterRosterCharacterState,
   type CharacterRosterCommitReceipt,
@@ -16,7 +17,9 @@ import {
   type CharacterRosterRelationship,
   type CharacterRosterRole,
   type CharacterRosterSnapshot,
+  type CharacterStateFieldProvenance,
 } from '../../src/shared/character-roster'
+import type { FinalizedSourceIdentity } from '../../src/shared/finalized-continuity'
 import { getProjectDb } from '../database'
 import { CharacterRepository, type CharacterData } from './character-repository'
 import { ensureCharacterRosterSchema } from './character-roster-schema'
@@ -77,12 +80,57 @@ function isRosterRole(value: unknown): value is CharacterRosterRole {
     && (CHARACTER_ROSTER_ROLES as readonly string[]).includes(value)
 }
 
+function normalizeFinalizedSource(value: unknown): FinalizedSourceIdentity {
+  if (!isObject(value)) throw new Error('定稿来源收据格式无效')
+  const finalizationId = requiredText(value.finalizationId, '定稿来源 ID')
+  const contentHash = requiredText(value.contentHash, '定稿正文哈希')
+  if (
+    !Number.isSafeInteger(value.draftId) || (value.draftId as number) < 1
+    || !Number.isSafeInteger(value.chapterNumber) || (value.chapterNumber as number) < 1
+    || !finalizationId
+    || !/^[a-f0-9]{64}$/u.test(contentHash)
+  ) throw new Error('定稿来源收据格式无效')
+  return {
+    draftId: value.draftId as number,
+    finalizationId,
+    chapterNumber: value.chapterNumber as number,
+    contentHash,
+  }
+}
+
+function normalizeFieldProvenance(value: unknown): CharacterStateFieldProvenance {
+  if (!isObject(value)) throw new Error('角色状态来源格式无效')
+  if (value.kind === 'legacy') return { kind: 'legacy' }
+  if (value.kind === 'author') {
+    if (!Number.isSafeInteger(value.chapterNumber) || (value.chapterNumber as number) < 0) {
+      throw new Error('作者角色状态章节无效')
+    }
+    return { kind: 'author', chapterNumber: value.chapterNumber as number }
+  }
+  if (value.kind === 'derived') {
+    return { kind: 'derived', source: normalizeFinalizedSource(value.source) }
+  }
+  throw new Error('角色状态来源类型无效')
+}
+
 function normalizeState(value: unknown): CharacterRosterCharacterState | undefined {
   if (value === undefined) return undefined
   if (!isObject(value)) throw new Error('角色动态状态格式无效')
   const updatedAtChapter = value.updatedAtChapter
   if (!Number.isSafeInteger(updatedAtChapter) || (updatedAtChapter as number) < 0) {
     throw new Error('角色动态状态章节号无效')
+  }
+  const rawProvenance = value.provenance === undefined ? {} : value.provenance
+  if (!isObject(rawProvenance)) throw new Error('角色状态来源格式无效')
+  const provenance: NonNullable<CharacterRosterCharacterState['provenance']> = {}
+  for (const field of CHARACTER_STATE_TEXT_FIELDS) {
+    const normalizedValue = requiredText(value[field], `角色状态 ${field}`)
+    if (Object.hasOwn(rawProvenance, field)) {
+      provenance[field] = normalizeFieldProvenance(rawProvenance[field])
+    } else if (normalizedValue) {
+      // Pre-v2 and non-manual generation values stay visible but never become author facts.
+      provenance[field] = { kind: 'legacy' }
+    }
   }
   return {
     location: requiredText(value.location, '角色当前位置'),
@@ -92,6 +140,7 @@ function normalizeState(value: unknown): CharacterRosterCharacterState | undefin
     keyItems: requiredText(value.keyItems, '角色关键道具'),
     recentEvents: requiredText(value.recentEvents, '角色最近事件'),
     updatedAtChapter: updatedAtChapter as number,
+    ...(Object.keys(provenance).length > 0 ? { provenance } : {}),
   }
 }
 
@@ -143,19 +192,21 @@ function normalizeRelationships(value: unknown, ownerName: string): CharacterRos
 
 function normalizeEntry(
   value: unknown,
-  allowLegacyRelationshipNotes: boolean,
 ): CharacterRosterEntry {
   if (!isObject(value)) throw new Error('角色名单条目格式无效')
   const name = requiredText(value.name, '角色名')
   if (!name) throw new Error('角色名不能为空')
   if (!isRosterRole(value.role)) throw new Error(`角色「${name}」的定位无效`)
 
-  if (Object.hasOwn(value, 'legacyRelationshipNotes') && !allowLegacyRelationshipNotes) {
-    throw new Error('只有手工角色管理可以提交自由文本关系')
-  }
-  const legacyRelationshipNotes = allowLegacyRelationshipNotes && typeof value.legacyRelationshipNotes === 'string'
-    ? value.legacyRelationshipNotes.trim()
-    : undefined
+  // 关系备注是一等事实：任何通道（手工编辑、角色卡导入、蓝图同步、架构生成、
+  // 章节推进）都可以提交。旧调用方沿用 legacyRelationshipNotes 键名提交的
+  // 是同一份数据，这里一并接受，避免升级期出现两套语义。
+  const rawRelationshipNotes = typeof value.relationshipNotes === 'string'
+    ? value.relationshipNotes
+    : typeof value.legacyRelationshipNotes === 'string'
+      ? value.legacyRelationshipNotes
+      : undefined
+  const relationshipNotes = rawRelationshipNotes?.trim()
   return {
     name,
     role: value.role,
@@ -170,7 +221,7 @@ function normalizeEntry(
     arc: requiredText(value.arc, `角色「${name}」的弧光`),
     notes: requiredText(value.notes, `角色「${name}」的备注`),
     currentState: normalizeState(value.currentState),
-    ...(legacyRelationshipNotes ? { legacyRelationshipNotes } : {}),
+    ...(relationshipNotes ? { relationshipNotes } : {}),
   }
 }
 
@@ -211,7 +262,10 @@ function normalizeRequest(value: unknown): CharacterRosterCommitRequest {
     throw new Error('角色名单不能为空')
   }
 
-  const entries = value.entries.map(entry => normalizeEntry(entry, isManualEditIntent(intent)))
+  const source = value.source === undefined ? undefined : normalizeFinalizedSource(value.source)
+  if (intent === 'chapter_progress' && !source) throw new Error('章节状态更新缺少定稿来源收据')
+  if (intent !== 'chapter_progress' && source) throw new Error('只有章节状态更新可携带定稿来源收据')
+  const entries = value.entries.map(entry => normalizeEntry(entry))
   const names = new Set(entries.map(entry => characterRosterIdentityKey(entry.name)))
   if (names.size !== entries.length) throw new Error('角色名必须唯一')
   // 批量生成/导入/蓝图/定稿的增量候选可以引用“本次没有变化”的既有角色；
@@ -228,6 +282,11 @@ function normalizeRequest(value: unknown): CharacterRosterCommitRequest {
     }
   }
   const renames = normalizeRenames(value.renames, intent)
+  // 「同名条目以候选为准」只对角色卡导入开放：其他通道没有作者的逐条确认。
+  const overwriteExisting = value.overwriteExisting === true
+  if (overwriteExisting && intent !== 'novel_import') {
+    throw new Error('只有角色卡导入可以按候选内容覆盖同名角色')
+  }
   let expectedLegacyMarkdown: string | undefined
   if (isLegacyEvidenceIntent(intent)) {
     if (typeof value.expectedLegacyMarkdown !== 'string') {
@@ -241,7 +300,9 @@ function normalizeRequest(value: unknown): CharacterRosterCommitRequest {
     expectedRevision: value.expectedRevision as number,
     schemaVersion: CHARACTER_ROSTER_SCHEMA_VERSION,
     entries,
+    ...(source ? { source } : {}),
     intent,
+    ...(overwriteExisting ? { overwriteExisting } : {}),
     ...(renames?.length ? { renames } : {}),
     ...(isLegacyEvidenceIntent(intent)
       ? { expectedLegacyMarkdown }
@@ -251,12 +312,20 @@ function normalizeRequest(value: unknown): CharacterRosterCommitRequest {
 
 function canonicalEntries(entries: CharacterRosterEntry[]): CharacterRosterEntry[] {
   return [...entries]
-    .map(entry => ({
-      ...entry,
-      relationships: [...entry.relationships].sort((left, right) => (
-        compareText(left.target, right.target) || compareText(left.relation, right.relation)
-      )),
-    }))
+    .map((entry) => {
+      const canonical: CharacterRosterEntry = {
+        ...entry,
+        relationships: [...entry.relationships].sort((left, right) => (
+          compareText(left.target, right.target) || compareText(left.relation, right.relation)
+        )),
+      }
+      // 关系备注参与事实哈希：先归一到「有内容才存在」的形态，避免纯空白
+      // 差异让同一份事实产生两个不同哈希。
+      const relationshipNotes = entry.relationshipNotes?.trim()
+      if (relationshipNotes) canonical.relationshipNotes = relationshipNotes
+      else delete canonical.relationshipNotes
+      return canonical
+    })
     .sort((left, right) => compareText(left.name, right.name))
 }
 
@@ -272,6 +341,8 @@ function payloadHash(request: CharacterRosterCommitRequest): string {
       ? { expectedLegacyMarkdown: request.expectedLegacyMarkdown }
       : {}),
     ...(request.intent === 'manual_edit' ? { renames: request.renames ?? [] } : {}),
+    ...(request.overwriteExisting ? { overwriteExisting: true } : {}),
+    ...(request.source ? { source: request.source } : {}),
     entries: canonicalEntries(request.entries),
   }))
 }
@@ -294,6 +365,12 @@ function entryFromCharacter(character: CharacterData): CharacterRosterEntry {
   const relationships = hasStructuredRelationships
     ? JSON.parse(character.relationships) as CharacterRosterRelationship[]
     : []
+  // 旧项目的自由文本直接躺在 relationships 列里：读取时按「关系备注」迁移到
+  // 独立字段。原文一字不改，只是从此与结构化边各自独立存在。
+  const legacyText = !hasStructuredRelationships && character.relationships.trim()
+    ? character.relationships.trim()
+    : ''
+  const relationshipNotes = (character.relationshipNotes ?? '').trim() || legacyText
   return {
     name: character.name,
     role: normalizeCharacterRole(character.role),
@@ -310,9 +387,7 @@ function entryFromCharacter(character: CharacterData): CharacterRosterEntry {
     arc: character.arc,
     notes: character.notes,
     currentState: character.currentState,
-    ...(hasStructuredRelationships || !character.relationships
-      ? {}
-      : { legacyRelationshipNotes: character.relationships }),
+    ...(relationshipNotes ? { relationshipNotes } : {}),
   }
 }
 
@@ -327,11 +402,10 @@ function characterFromEntry(entry: CharacterRosterEntry): CharacterData {
     background: entry.background,
     abilities: entry.abilities,
     motivation: entry.motivation,
-    // 旧手工卡的自由文本关系尚无安全的字段级迁移；安全重生成时必须原样
-    // 保留，不能为了写入新候选而把它静默替换为 JSON。
-    relationships: entry.legacyRelationshipNotes?.trim()
-      ? entry.legacyRelationshipNotes
-      : JSON.stringify(entry.relationships),
+    // 结构化边恒以 JSON 数组落库，作者的关系原话落在独立的备注列：两者不再
+    // 争用同一列，因此改边不会吞掉原话，改原话也不会压掉边。
+    relationships: JSON.stringify(entry.relationships),
+    relationshipNotes: entry.relationshipNotes?.trim() ?? '',
     arc: entry.arc,
     notes: entry.notes,
     currentState: entry.currentState,
@@ -371,11 +445,78 @@ function mergeExistingEntryManualWins(
       Object.assign(merged, { [field]: generated[field] })
     }
   }
-  merged.relationships = existing.legacyRelationshipNotes?.trim() || existing.relationships.length > 0
+  // 结构化边与关系备注各自独立合并：已有的一侧优先（作者事实不被自动流程
+  // 覆盖），为空的一侧才接受本轮生成值。两者不再互相压制。
+  merged.relationships = existing.relationships.length > 0
     ? existing.relationships
     : generated.relationships
+  const mergedRelationshipNotes = existing.relationshipNotes?.trim() || generated.relationshipNotes?.trim()
+  if (mergedRelationshipNotes) merged.relationshipNotes = mergedRelationshipNotes
+  else delete merged.relationshipNotes
   merged.currentState = mergeCurrentStateManualWins(existing.currentState, generated.currentState)
   return merged
+}
+
+/**
+ * 同名条目的「候选优先」合并。
+ *
+ * 作者在候选面板里明确选了覆盖（或在合并窗口里逐项确认过），于是候选**非空**
+ * 的字段一律生效；候选没写的字段保留原值 —— 先生定的语义：「新卡没写年龄，
+ * 18 岁就不会被抹掉；新卡写了 25 岁，才会被覆盖」。章节动态状态是运行时事实，
+ * 导入永远不动它。
+ */
+function mergeExistingEntryIncomingWins(
+  existing: CharacterRosterEntry,
+  generated: CharacterRosterEntry,
+): CharacterRosterEntry {
+  const merged: CharacterRosterEntry = { ...existing, name: existing.name.trim() }
+  const fields: Array<keyof Pick<
+    CharacterRosterEntry,
+    'role' | 'gender' | 'age' | 'appearance' | 'personality' | 'background' | 'abilities' | 'motivation' | 'arc' | 'notes'
+  >> = [
+    'role', 'gender', 'age', 'appearance', 'personality', 'background', 'abilities', 'motivation', 'arc', 'notes',
+  ]
+  for (const field of fields) {
+    if (hasManualValue(generated[field])) Object.assign(merged, { [field]: generated[field] })
+  }
+  if (generated.relationships.length > 0) merged.relationships = generated.relationships
+  const generatedNotes = generated.relationshipNotes?.trim()
+  if (generatedNotes) merged.relationshipNotes = generatedNotes
+  else if (!existing.relationshipNotes?.trim()) delete merged.relationshipNotes
+  merged.currentState = existing.currentState
+  return merged
+}
+
+/**
+ * 架构重新生成是**替换**语义：本轮生成的名单就是完整事实源。
+ *
+ * 与 `mergeGeneratedEntriesWithExisting` 的区别只有一条，但它是决定性的：
+ * 未出现在本轮候选中的旧角色会被移除，而不是被保留。UI 在「AI 生成故事架构」
+ * 里把该步骤显示为「将覆盖」，保留旧角色会让多轮生成的设定同时留在名单里，
+ * 下游（目录/蓝图、写稿注入、后处理）会同时读到两套互相矛盾的角色事实。
+ *
+ * 保留的保护：同名条目的非空人工字段仍然 manual-wins（沿用作者手写资料），
+ * 但 relationships 一律取本轮生成的关系 —— 关系是设定结构，必须与替换后的
+ * 名单自洽，否则被移除角色会留下悬空的关系端点。
+ */
+function replaceGeneratedEntriesWithExisting(
+  generatedEntries: CharacterRosterEntry[],
+  existingEntries: CharacterRosterEntry[],
+): CharacterRosterEntry[] {
+  const existingByName = new Map(
+    existingEntries.map(entry => [characterRosterIdentityKey(entry.name), entry]),
+  )
+  const replaced = generatedEntries.map((generated) => {
+    const existing = existingByName.get(characterRosterIdentityKey(generated.name))
+    if (!existing) return generated
+    const merged = mergeExistingEntryManualWins(existing, generated)
+    // 关系是设定结构，必须与替换后的名单自洽：本轮生成的结构化边覆盖旧边。
+    // 作者手写的关系原话是独立的作者事实，仍由 mergeExistingEntryManualWins
+    // 按 manual-wins 保留。
+    return { ...merged, relationships: generated.relationships }
+  })
+  assertRelationshipClosure(replaced)
+  return replaced
 }
 
 function assertRelationshipClosure(entries: readonly CharacterRosterEntry[]): void {
@@ -402,17 +543,24 @@ function assertRelationshipClosure(entries: readonly CharacterRosterEntry[]): vo
 }
 
 /**
- * 正常架构重新生成延续旧的 manual-wins 安全规则：非空旧字段和未出现在
- * 本轮候选中的旧角色都保留；空字段才由新候选补齐。该策略不猜测字段来源。
+ * 仿写导入（novel_import）的保守合并：非空旧字段和未出现在本轮候选中的旧
+ * 角色都保留，空字段才由新候选补齐。该策略不猜测字段来源。
+ *
+ * 架构重新生成不走这里 —— 它必须让「将覆盖」名副其实，见
+ * `replaceGeneratedEntriesWithExisting`。
  */
 function mergeGeneratedEntriesWithExisting(
   generatedEntries: CharacterRosterEntry[],
   existingEntries: CharacterRosterEntry[],
+  overwriteExisting = false,
 ): CharacterRosterEntry[] {
   const generatedByName = new Map(generatedEntries.map(entry => [characterRosterIdentityKey(entry.name), entry]))
   const mergedExisting = existingEntries.map((existing) => {
     const generated = generatedByName.get(characterRosterIdentityKey(existing.name))
-    return generated ? mergeExistingEntryManualWins(existing, generated) : { ...existing }
+    if (!generated) return { ...existing }
+    return overwriteExisting
+      ? mergeExistingEntryIncomingWins(existing, generated)
+      : mergeExistingEntryManualWins(existing, generated)
   })
   const existingNames = new Set(existingEntries.map(entry => characterRosterIdentityKey(entry.name)))
   const additions = generatedEntries.filter(entry => !existingNames.has(characterRosterIdentityKey(entry.name)))
@@ -430,17 +578,83 @@ function hasFinalizedDraft(db: BetterSqlite3.Database, chapterNumber: number): b
   `).get(chapterNumber) !== undefined
 }
 
+function assertCurrentFinalizedSource(
+  db: BetterSqlite3.Database,
+  source: FinalizedSourceIdentity,
+): void {
+  const row = db.prepare(`
+    SELECT drafts.chapter_number AS chapterNumber, drafts.status,
+           finalization_outbox.finalization_id AS finalizationId,
+           finalization_outbox.content_hash AS contentHash
+    FROM drafts
+    JOIN finalization_outbox ON finalization_outbox.draft_id = drafts.id
+    WHERE drafts.id = ?
+  `).get(source.draftId) as {
+    chapterNumber: number
+    status: string
+    finalizationId: string
+    contentHash: string
+  } | undefined
+  if (
+    !row
+    || row.status !== 'finalized'
+    || row.chapterNumber !== source.chapterNumber
+    || row.finalizationId !== source.finalizationId
+    || row.contentHash !== source.contentHash
+  ) throw new Error('角色状态来源已失效，已拒绝过期后处理写入')
+}
+
+function mergeDerivedCurrentState(
+  existing: CharacterRosterCharacterState | undefined,
+  candidate: CharacterRosterCharacterState,
+  source: FinalizedSourceIdentity,
+): CharacterRosterCharacterState | undefined {
+  const merged: CharacterRosterCharacterState = existing
+    ? { ...existing, provenance: { ...existing.provenance } }
+    : {
+        location: '', powerLevel: '', physicalState: '', mentalState: '',
+        keyItems: '', recentEvents: '', updatedAtChapter: source.chapterNumber,
+      }
+  let changed = false
+  for (const field of CHARACTER_STATE_TEXT_FIELDS) {
+    const provenance = candidate.provenance?.[field]
+    if (provenance?.kind !== 'derived') continue
+    if (
+      provenance.source.draftId !== source.draftId
+      || provenance.source.finalizationId !== source.finalizationId
+      || provenance.source.chapterNumber !== source.chapterNumber
+      || provenance.source.contentHash !== source.contentHash
+    ) throw new Error('角色状态字段与定稿来源不一致')
+
+    const previousSource = existing?.provenance?.[field]
+    const previousValue = existing?.[field] ?? ''
+    // Unknown legacy and explicit author values are never silently reclassified or overwritten.
+    if (previousValue && previousSource?.kind !== 'derived') continue
+    if (previousSource?.kind === 'author' || previousSource?.kind === 'legacy') continue
+    merged[field] = candidate[field]
+    merged.provenance ??= {}
+    merged.provenance[field] = provenance
+    changed = true
+  }
+  if (!changed) return existing
+  merged.updatedAtChapter = source.chapterNumber
+  return merged
+}
+
 function mergeIncrementalEntriesWithExisting(
   db: BetterSqlite3.Database,
   candidates: CharacterRosterEntry[],
   existingEntries: CharacterRosterEntry[],
   intent: Extract<CharacterRosterCommitIntent, 'blueprint_sync' | 'chapter_progress'>,
+  source?: FinalizedSourceIdentity,
 ): CharacterRosterEntry[] {
   if (intent === 'chapter_progress') {
+    if (!source) throw new Error('章节状态更新缺少定稿来源收据')
+    assertCurrentFinalizedSource(db, source)
     for (const candidate of candidates) {
       if (
         !candidate.currentState
-        || !hasFinalizedDraft(db, candidate.currentState.updatedAtChapter)
+        || candidate.currentState.updatedAtChapter !== source.chapterNumber
       ) {
         throw new Error(`角色「${candidate.name}」的章节状态尚未定稿，已拒绝后处理写入`)
       }
@@ -467,8 +681,8 @@ function mergeIncrementalEntriesWithExisting(
       relationships: candidate.relationships.length > 0
         ? candidate.relationships
         : existing.relationships,
-      ...(intent === 'chapter_progress' && candidate.currentState
-        ? { currentState: candidate.currentState }
+      ...(intent === 'chapter_progress' && candidate.currentState && source
+        ? { currentState: mergeDerivedCurrentState(existing.currentState, candidate.currentState, source) }
         : {}),
     }
     return merged
@@ -531,9 +745,25 @@ function resolveManualEntries(
     const originalName = renameByNew.get(candidate.name) ?? candidate.name
     const existing = existingByName.get(originalName)
     const mapped = mapManualRelationshipTargets(candidate, renameByOriginal, finalNames)
-    return existing?.legacyRelationshipNotes && !mapped.legacyRelationshipNotes
-      ? { ...mapped, legacyRelationshipNotes: existing.legacyRelationshipNotes }
-      : mapped
+    // 候选是作者的完整意图：结构化边与关系备注分列存放、各自独立落库，因此
+    // 这里不再把库里的旧备注强行回注 —— 那会让「把自由文本改写成结构化关系」
+    // 或「清空关系」的保存被旧值复活，甚至因回读不一致而整次回滚。
+    if (!mapped.currentState) return mapped
+    const provenance = { ...mapped.currentState.provenance }
+    for (const field of CHARACTER_STATE_TEXT_FIELDS) {
+      if ((existing?.currentState?.[field] ?? '') !== mapped.currentState[field]) {
+        provenance[field] = {
+          kind: 'author',
+          chapterNumber: mapped.currentState.updatedAtChapter,
+        }
+      } else if (existing?.currentState?.provenance?.[field]) {
+        provenance[field] = existing.currentState.provenance[field]
+      }
+    }
+    return {
+      ...mapped,
+      currentState: { ...mapped.currentState, provenance },
+    }
   })
   assertRelationshipClosure(entries)
   return { entries, renameByOriginal }
@@ -618,10 +848,10 @@ export function renderCharacterRosterMarkdown(
         ? `- Relationship: ${relationship.target} (${relationship.relation})`
         : `- 关系：${relationship.target}（${relationship.relation}）`)
     }
-    if (entry.legacyRelationshipNotes) {
+    if (entry.relationshipNotes) {
       lines.push(english
-        ? `- Relationship notes: ${entry.legacyRelationshipNotes}`
-        : `- 关系备注：${entry.legacyRelationshipNotes}`)
+        ? `- Relationship notes: ${entry.relationshipNotes}`
+        : `- 关系备注：${entry.relationshipNotes}`)
     }
     return lines.join('\n')
   })
@@ -653,6 +883,7 @@ function deriveRosterStatus(
   entries: readonly CharacterRosterEntry[],
   renderedMarkdown: string,
   currentProjection: string,
+  hasLegacyRelationshipText: boolean,
 ): CharacterRosterStatus {
   switch (meta.migration_state) {
     case 'empty':
@@ -668,20 +899,30 @@ function deriveRosterStatus(
         ? 'legacy_repair_required'
         : 'inconsistent'
     case 'ready':
-      // #83 起，read/commit 是唯一写入 seam。投影和包含 currentState 的
-      // 完整事实哈希都必须与表内事实一致，才能让 UI/工作流继续写入。
-      if (
-        meta.projection_hash !== hashText(renderedMarkdown)
-        || meta.fact_hash !== fullFactHash([...entries])
-        || currentProjection !== renderedMarkdown
-      ) return 'inconsistent'
+      // 「关系备注分列」迁移在读取时把旧项目的 relationships 自由文本迁到
+      // relationshipNotes，会合法改变事实哈希与投影哈希。只要表里还留着旧格式
+      // 自由文本（迁移尚未通过第一次 commit 回填完成），就不拿 fact_hash 卡门，
+      // 否则旧项目会「不一致 → 拒绝 commit → 永远无法回填」的死锁。
+      // 迁移完成（表内全为结构化 JSON）后，fact_hash 一旦与事实不符，只能是
+      // 绕过 roster 的旁路直接写 —— 必须 fail-closed。
+      if (!hasLegacyRelationshipText) {
+        if (
+          meta.projection_hash !== hashText(renderedMarkdown)
+          || meta.fact_hash !== fullFactHash([...entries])
+          || currentProjection !== renderedMarkdown
+        ) return 'inconsistent'
+      }
       return entries.length > 0 ? 'ready' : 'empty'
   }
 }
 
 function readSnapshot(db: BetterSqlite3.Database): CharacterRosterSnapshot {
   const meta = readMeta(db)
-  const entries = sortedEntries(CharacterRepository.getAll().map(entryFromCharacter))
+  const characters = CharacterRepository.getAll()
+  const entries = sortedEntries(characters.map(entryFromCharacter))
+  const hasLegacyRelationshipText = characters.some(
+    character => character.relationships.trim() !== '' && !isStructuredRelationships(character.relationships),
+  )
   const writingLanguage = ProjectCoreRepository.get()?.writingLanguage ?? DEFAULT_WRITING_LANGUAGE
   const currentProjection = readCurrentProjection(db)
   const localizedProjection = renderCharacterRosterMarkdown(entries, writingLanguage)
@@ -702,7 +943,7 @@ function readSnapshot(db: BetterSqlite3.Database): CharacterRosterSnapshot {
     schemaVersion: CHARACTER_ROSTER_SCHEMA_VERSION,
     revision: meta.revision,
     migrationState: meta.migration_state,
-    status: deriveRosterStatus(meta, entries, renderedMarkdown, currentProjection),
+    status: deriveRosterStatus(meta, entries, renderedMarkdown, currentProjection, hasLegacyRelationshipText),
     entries,
     renderedMarkdown,
     projectionHash,
@@ -847,16 +1088,19 @@ export class CharacterRosterRepository {
               renameByOriginal = resolved.renameByOriginal
               return resolved.entries
             })()
-          : maySafelyRegenerate || isNovelImport
-            ? mergeGeneratedEntriesWithExisting(request.entries, existingEntries)
-            : isIncremental
-              ? mergeIncrementalEntriesWithExisting(
-                  db,
-                  request.entries,
-                  existingEntries,
-                  intent as Extract<CharacterRosterCommitIntent, 'blueprint_sync' | 'chapter_progress'>,
-                )
-              : request.entries
+          : isNovelImport
+            ? mergeGeneratedEntriesWithExisting(request.entries, existingEntries, request.overwriteExisting === true)
+            : maySafelyRegenerate
+              ? replaceGeneratedEntriesWithExisting(request.entries, existingEntries)
+              : isIncremental
+                ? mergeIncrementalEntriesWithExisting(
+                    db,
+                    request.entries,
+                    existingEntries,
+                    intent as Extract<CharacterRosterCommitIntent, 'blueprint_sync' | 'chapter_progress'>,
+                    request.source,
+                  )
+                : request.entries
       const writingLanguage = ProjectCoreRepository.get()?.writingLanguage ?? DEFAULT_WRITING_LANGUAGE
       const projection = renderCharacterRosterMarkdown(committedEntries, writingLanguage)
       const projectionHash = hashText(projection)
@@ -868,9 +1112,25 @@ export class CharacterRosterRepository {
       if (isManualEdit) {
         // 手工保存提交的是完整名单快照。先清空再回填使删除、改名（包括交换）
         // 与资料变更受同一事务保护；transaction 回滚时不会留下半个名单。
+        //
+        // avatar 是作者的手工资产，刻意不在 upsert 的写入与 ON CONFLICT 更新
+        // 列表里（见 CharacterRepository）。清表回填会把它连同旧行一起抹掉 ——
+        // 于是「保存一个角色」就等于「清空全名单的头像」：给反派设好头像后，
+        // 主角的头像就变空白。这里按回填前的名字取走、回填后按改名映射放回。
+        const avatarByStoredName = new Map(
+          CharacterRepository.getAll().map(character => [character.name, character.avatar ?? '']),
+        )
+        const storedNameByFinalName = new Map(
+          [...renameByOriginal].map(([originalName, newName]) => [newName, originalName]),
+        )
         db.prepare('DELETE FROM characters').run()
         for (const entry of committedEntries) {
           CharacterRepository.upsert(characterFromEntry(entry))
+        }
+        for (const entry of committedEntries) {
+          const storedName = storedNameByFinalName.get(entry.name) ?? entry.name
+          const avatar = avatarByStoredName.get(storedName)
+          if (avatar) CharacterRepository.setAvatar(entry.name, avatar)
         }
         updateBlueprintReferencesForManualEdit(
           db,
@@ -878,6 +1138,19 @@ export class CharacterRosterRepository {
           new Set(committedEntries.map(entry => entry.name)),
         )
       } else if (!isLegacyCardsAdoption) {
+        if (maySafelyRegenerate) {
+          // 替换语义的删除半边：本轮名单是完整事实源，未列入的角色必须移除，
+          // 否则多轮生成的角色会同时留在 characters 表里（UI 已承诺「将覆盖」）。
+          // 与 upsert 处于同一 transaction，失败时整体回滚，不会留下半个名单。
+          const keptKeys = new Set(
+            committedEntries.map(entry => characterRosterIdentityKey(entry.name)),
+          )
+          for (const entry of existingEntries) {
+            if (!keptKeys.has(characterRosterIdentityKey(entry.name))) {
+              CharacterRepository.delete(entry.name)
+            }
+          }
+        }
         for (const entry of committedEntries) CharacterRepository.upsert(characterFromEntry(entry))
       }
       const coreUpdate = db.prepare(`

@@ -25,7 +25,18 @@ export interface PartialArchData {
   character_dynamics_result?: string
   character_state_result?: string
   world_building_result?: string
+  /** 世界观输出达到长度上限时保存的未完成候选；不写入正式 worldbuilding。 */
+  world_building_partial_result?: string
+  world_building_incomplete?: boolean
+  /** 候选赖以生成的输入指纹；项目事实变化后禁止自动续写。 */
+  world_building_facts_fingerprint?: string
+  /** 候选创建时正式世界观的指纹；避免恢复时覆盖后来编辑的完整成果。 */
+  world_building_db_hash?: string
+  /** 候选实际使用的作者步骤指导；恢复时沿用，不读取新输入。 */
+  world_building_step_guidance?: string
   synopsis_result?: string
+  /** 情节大纲在上一次生成中被输出长度中断；synopsis_result 为已完成部分。 */
+  synopsis_incomplete?: boolean
 }
 
 export interface ArchitectureWorkflowParams {
@@ -36,6 +47,12 @@ export interface ArchitectureWorkflowParams {
   selectedSteps?: Array<'premise' | 'characters' | 'worldbuilding' | 'synopsis'>
   /** 每步的补充指导（如 { premise: "多强调金手指的限制" }） */
   stepGuidance?: Record<string, string>
+  /** 情节大纲本次生成范围 [from..to]（缺省 = 第 1 章到全书）。 */
+  synopsisRange?: { from: number; to: number } | null
+  /** 从上次输出长度中断的检查点续写情节大纲（工作流只包含 synopsis 一步）。 */
+  resumeSynopsis?: boolean
+  /** 从上次输出长度中断的候选续写世界观（工作流只包含 worldbuilding 一步）。 */
+  resumeWorldBuilding?: boolean
 }
 
 export interface ConfigGenerationWorkflowParams {
@@ -57,7 +74,16 @@ export function createArchitectureWorkflow(
   uiLocale: Locale = useLocaleStore.getState().locale,
 ): WorkflowDefinition {
   const text = (zhCNText: string, enUSText: string) => localize(uiLocale, zhCNText, enUSText)
-  const sel = params.selectedSteps ?? ['premise', 'characters', 'worldbuilding', 'synopsis']
+  const resumingSynopsis = params.resumeSynopsis === true
+  const resumingWorldBuilding = params.resumeWorldBuilding === true
+  if (resumingSynopsis && resumingWorldBuilding) {
+    throw new Error(text('一次只能恢复一个故事架构步骤', 'Only one story-architecture step can be resumed at a time.'))
+  }
+  const sel = resumingSynopsis
+    ? ['synopsis' as const]
+    : resumingWorldBuilding
+      ? ['worldbuilding' as const]
+      : params.selectedSteps ?? ['premise', 'characters', 'worldbuilding', 'synopsis']
   const expectedProjectPath = params.projectPath
   const project = useProjectStore.getState().currentProject
   const currentProjectSession = projectSessionContextFromProject(project)
@@ -105,21 +131,30 @@ export function createArchitectureWorkflow(
     {
       name: text('世界观', 'World building'),
       key: 'worldbuilding',
-      description: stepDesc('worldbuilding', '构建自带冲突引擎的世界观矩阵', 'Build a world matrix with its own conflict engine'),
+      description: resumingWorldBuilding
+        ? text('从已保存的未完成候选继续生成世界观', 'Resume worldbuilding from the saved incomplete candidate')
+        : stepDesc('worldbuilding', '构建自带冲突引擎的世界观矩阵', 'Build a world matrix with its own conflict engine'),
       executor: async (step: unknown, context: WorkflowContext, callbacks: StepCallbacks) => {
         context.data.stepGuidance = guidance
         const { GenerateWorldBuildingCommand } = await import('./commands/architecture.command')
-        return new GenerateWorldBuildingCommand(projectSnapshot).execute({ step, context, callbacks })
+        return new GenerateWorldBuildingCommand(projectSnapshot, undefined, {
+          resumeWorldBuilding: params.resumeWorldBuilding,
+        }).execute({ step, context, callbacks })
       },
     },
     {
       name: text('情节大纲', 'Plot outline'),
       key: 'synopsis',
-      description: stepDesc('synopsis', '整合所有碎片，按选定结构模式生成情节大纲', 'Integrate all inputs into a plot outline using the selected structure'),
+      description: resumingSynopsis
+        ? text('从上次中断点继续生成情节大纲', 'Resume the plot outline from the interrupted point')
+        : stepDesc('synopsis', '整合所有碎片，按选定结构模式生成情节大纲', 'Integrate all inputs into a plot outline using the selected structure'),
       executor: async (step: unknown, context: WorkflowContext, callbacks: StepCallbacks) => {
         context.data.stepGuidance = guidance
         const { GeneratePlotArchitectureCommand } = await import('./commands/architecture.command')
-        return new GeneratePlotArchitectureCommand(sel, projectSnapshot).execute({ step, context, callbacks })
+        return new GeneratePlotArchitectureCommand(sel, projectSnapshot, undefined, {
+          resumeSynopsis: params.resumeSynopsis,
+          synopsisRange: params.synopsisRange ?? null,
+        }).execute({ step, context, callbacks })
       },
     },
   ]
@@ -128,7 +163,11 @@ export function createArchitectureWorkflow(
 
   return {
     type: 'architecture_generation',
-    title: text('生成故事架构', 'Generate story architecture'),
+    title: resumingSynopsis
+      ? text('继续生成情节大纲（断点续写）', 'Continue plot outline (resume)')
+      : resumingWorldBuilding
+        ? text('继续生成世界观（断点续写）', 'Continue worldbuilding (resume)')
+        : text('生成故事架构', 'Generate story architecture'),
     projectPath: expectedProjectPath,
     projectSession,
     uiLocale,

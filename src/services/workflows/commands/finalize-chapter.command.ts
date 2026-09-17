@@ -24,8 +24,10 @@ import {
 } from '../workflow-utils'
 import type { ChapterInfo } from '../chapter-workflow'
 import type {
+  FinalizedCharacterStateCandidate,
   FinalizedContinuityFact,
   FinalizedContinuityFactCategory,
+  FinalizedSourceIdentity,
 } from '../../../shared/finalized-continuity'
 import { readWorkflowDraftMeta } from '../workflow-draft-meta'
 import {
@@ -35,6 +37,7 @@ import {
   workflowWritingLanguage,
 } from '../workflow-project-session'
 import {
+  CHARACTER_STATE_TEXT_FIELDS,
   characterRosterIdentityKey,
   type CharacterRosterCharacterState,
   type CharacterRosterEntry,
@@ -79,16 +82,93 @@ function parseJSON<T>(text: string): T {
 const CONTINUITY_FACT_LIMIT = 12
 const CONTINUITY_STATEMENT_LIMIT = 280
 const CONTINUITY_EVIDENCE_LIMIT = 240
-const CHARACTER_STATE_TEXT_FIELDS = [
-  'location',
-  'powerLevel',
-  'physicalState',
-  'mentalState',
-  'keyItems',
-  'recentEvents',
-] as const satisfies ReadonlyArray<keyof Omit<CharacterRosterCharacterState, 'updatedAtChapter'>>
-
 type CharacterStatePatch = Partial<Pick<CharacterRosterCharacterState, typeof CHARACTER_STATE_TEXT_FIELDS[number]>>
+
+/** 世界观落袋：单次最多处理几条，以及单条陈述/证据的长度上限。 */
+const WORLD_SETTING_UPDATE_LIMIT = 8
+const WORLD_SETTING_STATEMENT_LIMIT = 120
+const WORLD_SETTING_EVIDENCE_LIMIT = 240
+
+interface WorldSettingUpdateItem {
+  entryName: string
+  evidence: string
+  statement: string
+}
+
+interface WorldSettingNewEntityItem {
+  name: string
+  evidence: string
+  statement: string
+}
+
+interface WorldSettingUpdateProposal {
+  updates: WorldSettingUpdateItem[]
+  conflicts: WorldSettingUpdateItem[]
+  newEntities: WorldSettingNewEntityItem[]
+}
+
+/**
+ * 解析定稿后的世界观落袋建议。
+ *
+ * 与角色状态解析的差别：这里**不抛错** —— 世界观落袋是"锦上添花"，
+ * 解析不出来就当本章没有可落袋的进展，绝不因为它让整条定稿链路失败。
+ * 但每一项都要严格校验：空名字、空证据、空陈述一律丢弃（宁缺毋滥，
+ * 不能让模型凑出来的空壳进事实源）。
+ */
+function parseWorldSettingUpdateProposal(content: string): WorldSettingUpdateProposal | null {
+  let parsed: unknown
+  try {
+    parsed = parseJSON<unknown>(content)
+  } catch {
+    return null
+  }
+  if (!isRecord(parsed)) return null
+
+  const readItems = (
+    value: unknown,
+    limit: number,
+  ): WorldSettingUpdateItem[] => {
+    if (!Array.isArray(value)) return []
+    const items: WorldSettingUpdateItem[] = []
+    for (const raw of value) {
+      if (items.length >= limit) break
+      if (!isRecord(raw)) continue
+      const entryName = typeof raw.entryName === 'string' ? raw.entryName.trim() : ''
+      const evidence = typeof raw.evidence === 'string' ? raw.evidence.trim() : ''
+      const statement = typeof raw.statement === 'string' ? raw.statement.trim() : ''
+      if (!entryName || !evidence || !statement) continue
+      items.push({
+        entryName,
+        evidence: evidence.slice(0, WORLD_SETTING_EVIDENCE_LIMIT),
+        statement: statement.slice(0, WORLD_SETTING_STATEMENT_LIMIT),
+      })
+    }
+    return items
+  }
+
+  const newEntities: WorldSettingNewEntityItem[] = []
+  if (Array.isArray(parsed.newEntities)) {
+    for (const raw of parsed.newEntities) {
+      if (newEntities.length >= WORLD_SETTING_UPDATE_LIMIT) break
+      if (!isRecord(raw)) continue
+      const name = typeof raw.name === 'string' ? raw.name.trim() : ''
+      const evidence = typeof raw.evidence === 'string' ? raw.evidence.trim() : ''
+      const statement = typeof raw.statement === 'string' ? raw.statement.trim() : ''
+      if (!name || !evidence || !statement) continue
+      newEntities.push({
+        name,
+        evidence: evidence.slice(0, WORLD_SETTING_EVIDENCE_LIMIT),
+        statement: statement.slice(0, WORLD_SETTING_STATEMENT_LIMIT),
+      })
+    }
+  }
+
+  return {
+    updates: readItems(parsed.updates, WORLD_SETTING_UPDATE_LIMIT),
+    conflicts: readItems(parsed.conflicts, WORLD_SETTING_UPDATE_LIMIT),
+    newEntities,
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
@@ -220,7 +300,6 @@ export function buildFinalizedContinuityFacts(
     .split(/\n+|(?<=[。！？.!?])\s*/u)
     .map(statement => statement.replace(/^\s*(?:[-*•]|\d+[.)、])\s*/u, '').trim())
     .filter(Boolean)
-    .slice(0, CONTINUITY_FACT_LIMIT)
   return statements.flatMap(statement => {
     const factEntities = entities.filter(entity => statement.includes(entity))
     const evidence = evidenceExcerpt(finalizedContent, statement, factEntities)
@@ -233,7 +312,7 @@ export function buildFinalizedContinuityFacts(
           evidence,
         }]
       : []
-  })
+  }).slice(0, CONTINUITY_FACT_LIMIT)
 }
 
 // ===== 后处理步骤构建器 =====
@@ -259,6 +338,8 @@ export function buildFinalizePostProcessSteps(
   finalizedDraftId?: number,
   chapterEntities: readonly string[] = [],
   uiLocale: Locale = 'zh-CN',
+  finalizedSource?: FinalizedSourceIdentity,
+  projectionGeneration?: number,
 ): PostProcessStep[] {
   const steps: PostProcessStep[] = []
   const text = (zhCNText: string, enUSText: string) => localize(uiLocale, zhCNText, enUSText)
@@ -324,6 +405,21 @@ export function buildFinalizePostProcessSteps(
       executor: async (callbacks, context) => {
         if (!context) throw new Error('定稿后处理缺少冻结工作流上下文')
         if (context.cancelled) throw new Error(workflowUiText(context, '工作流已取消', 'Workflow was cancelled.'))
+        if (
+          finalizedDraftId !== undefined
+          && (
+            !finalizedSource
+            || finalizedSource.draftId !== finalizedDraftId
+            || !Number.isSafeInteger(projectionGeneration)
+            || projectionGeneration! < 0
+          )
+        ) {
+          throw new Error(workflowUiText(
+            context,
+            '定稿连续性投影缺少模型调用前冻结的来源水位',
+            'The finalized continuity projection is missing the source watermark frozen before the model call.',
+          ))
+        }
         const projectSession = requireWorkflowProjectSession(context)
         const writingLanguage = workflowWritingLanguage(context)
         const notesTemplate = await resolvePromptTemplate('generate_chapter_notes', projectSession, writingLanguage)
@@ -356,6 +452,8 @@ export function buildFinalizePostProcessSteps(
               chapterNumber,
               chapterNotes: cleanNotes,
               facts,
+              projectionGeneration: projectionGeneration!,
+              source: finalizedSource!,
             },
             _project.path,
           )
@@ -446,15 +544,37 @@ export function buildFinalizePostProcessSteps(
         generatedCharacterCards = cardsResult
         let updatedCount = 0
         const changedEntries: CharacterRosterEntry[] = []
+        const blockedCandidates: FinalizedCharacterStateCandidate[] = []
         for (const character of allChars) {
           const patch = updatesByName.get(character.name)
           if (!patch) continue
           updatedCount += 1
           const currentState = character.currentState
-          const structuredCharacter = { ...character }
-          delete structuredCharacter.legacyRelationshipNotes
+          if (!finalizedSource || finalizedSource.draftId !== finalizedDraftId) {
+            throw new Error(workflowUiText(
+              context,
+              '角色状态更新缺少冻结定稿来源收据',
+              'The character-state update is missing its frozen finalization receipt.',
+            ))
+          }
+          // Only fields actually returned by this model call carry this derived receipt.
+          const provenance: NonNullable<CharacterRosterCharacterState['provenance']> = {}
+          for (const field of CHARACTER_STATE_TEXT_FIELDS) {
+            if (!Object.hasOwn(patch, field)) continue
+            provenance[field] = { kind: 'derived', source: finalizedSource }
+            const previousValue = currentState?.[field] ?? ''
+            const previousSource = currentState?.provenance?.[field]
+            const protectedValue = previousSource?.kind === 'author'
+              || previousSource?.kind === 'legacy'
+              || Boolean(previousValue && previousSource?.kind !== 'derived')
+            if (protectedValue && patch[field] !== previousValue) {
+              blockedCandidates.push({ characterName: character.name, field, value: patch[field] ?? '' })
+            }
+          }
+          // 章节推进只提交状态补丁：关系边与关系备注由主进程按既有事实保留，
+          // 候选无需（也不应该）在这里改写它们。
           changedEntries.push({
-            ...structuredCharacter,
+            ...character,
             currentState: {
               location: patch.location ?? currentState?.location ?? '',
               powerLevel: patch.powerLevel ?? currentState?.powerLevel ?? '',
@@ -463,6 +583,7 @@ export function buildFinalizePostProcessSteps(
               keyItems: patch.keyItems ?? currentState?.keyItems ?? '',
               recentEvents: patch.recentEvents ?? currentState?.recentEvents ?? '',
               updatedAtChapter: chapterNumber,
+              provenance,
             },
           })
         }
@@ -477,6 +598,7 @@ export function buildFinalizePostProcessSteps(
               expectedRevision: roster.revision,
               schemaVersion: 1,
               intent: 'chapter_progress',
+              source: finalizedSource,
               // chapter_progress only carries changed state for confirmed
               // characters; it never echoes untouched legacy relationship notes.
               entries: changedEntries,
@@ -490,6 +612,31 @@ export function buildFinalizePostProcessSteps(
               'Character-state updates could not be committed atomically.',
             ))
           }
+          if (blockedCandidates.length > 0) {
+            if (projectionGeneration === undefined) {
+              throw new Error(workflowUiText(
+                context,
+                '角色状态候选缺少连续性投影水位',
+                'The character-state candidates are missing the continuity projection watermark.',
+              ))
+            }
+            const candidateResult = await ipc.invokeWithProjectSession(
+              projectSession,
+              'db:continuity-save-character-state-candidates',
+              {
+                draftId: finalizedDraftId!,
+                chapterNumber,
+                candidates: blockedCandidates,
+                projectionGeneration,
+                source: finalizedSource!,
+              },
+              _project.path,
+            )
+            requireIpcSuccess(candidateResult, text(
+              '保存角色状态原文定位候选',
+              'Save character-state prose locators',
+            ))
+          }
           if (updatedCount > 0) callbacks.log(workflowUiText(
             context,
             `更新角色动态状态: ${updatedCount} 名`,
@@ -499,34 +646,307 @@ export function buildFinalizePostProcessSteps(
       },
     })
 
-  // ─── 步骤 4: 文风自动学习（每5章触发一次）─────────────────────────
-  if (chapterNumber % 5 === 0) {
-    steps.push({
-      key: 'style_analysis',
-      label: text('文风自动学习', 'Automatic style learning'),
-      critical: false,
-      executor: async (callbacks, context) => {
-        if (!context) throw new Error('定稿后处理缺少冻结工作流上下文')
-        if (context.cancelled) throw new Error(workflowUiText(context, '工作流已取消', 'Workflow was cancelled.'))
+  // ─── 步骤 4: 世界观设定落袋 ──────────────────────────────────────
+  //
+  // 先生点名要的那一环：正文一直往前写，设定库却停在建库那一刻 ——
+  // AI 手里的「事实源」会越来越过时，最后输出混乱。
+  // 这里把本章产生的设定进展落袋，分三档处理：
+  //   · updates     正文有原文证据的事实演进 → **自动追加**进条目（只增不改）
+  //   · conflicts   正文与条目直接矛盾     → 不自动改，记进日志请作者裁决
+  //   · newEntities 正文出现的全新专名     → 存成 pending 候选，作者确认后入库
+  // 只处理**作者为本章声明引用**的条目，与写稿/审稿的注入范围保持一致。
+  steps.push({
+    key: 'world_settings',
+    label: text('世界观设定更新', 'Update world settings'),
+    critical: false,
+    executor: async (callbacks, context) => {
+      if (!context) throw new Error('定稿后处理缺少冻结工作流上下文')
+      if (context.cancelled) throw new Error(workflowUiText(context, '工作流已取消', 'Workflow was cancelled.'))
+      const projectSession = requireWorkflowProjectSession(context)
+      const writingLanguage = workflowWritingLanguage(context)
+      const expectedProjectPath = _project.path
+
+      // 本章引用了哪些设定？没有引用也要继续跑 ——
+      // 因为**正文可能引出从未被任何章节引用过的新设定**，那种东西
+      // 如果不趁定稿时沉淀下来，作者永远不知道自己的世界里多了什么。
+      const refs = await ipc.invoke(
+        'world-setting:list-chapter-refs',
+        chapterNumber,
+        expectedProjectPath,
+      )
+      const allEntries = await ipc.invoke('world-setting:list', expectedProjectPath)
+      if (!Array.isArray(allEntries)) return
+      const byId = new Map<number, (typeof allEntries)[number]>()
+      for (const entry of allEntries) {
+        if (entry && typeof entry === 'object' && typeof entry.id === 'number') byId.set(entry.id, entry)
+      }
+      // 闸门：pending 候选不进任何 AI 链路（与写稿一致）。
+      const referenced = (Array.isArray(refs) ? refs : [])
+        .map(ref => (ref && typeof ref === 'object' && typeof ref.settingId === 'number'
+          ? byId.get(ref.settingId)
+          : undefined))
+        .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+        .filter(entry => entry.status !== 'pending')
+
+      const template = await resolvePromptTemplate('update_world_settings', projectSession, writingLanguage)
+      if (!template) throw new Error(workflowUiText(
+        context,
+        '未找到世界观更新模板',
+        'The world-setting update template was not found.',
+      ))
+
+      const builder = new PostProcessPromptBuilder(template, writingLanguage)
+        .withChapterContent(draftContent.trim())
+        .withChapterNumber(chapterNumber)
+        .withReferencedEntriesJson(referenced.map(entry => ({
+          name: entry.name,
+          summary: entry.summary,
+          content: entry.content,
+        })))
+
+      const raw = await generation.complete(builder, callbacks, 'structured-data', context)
+      if (context.cancelled) throw new Error(workflowUiText(context, '工作流已取消', 'Workflow was cancelled.'))
+      const proposal = parseWorldSettingUpdateProposal(raw)
+      if (!proposal) {
+        // 解析失败不影响定稿（critical: false），但要留下线索。
         callbacks.log(workflowUiText(
           context,
-          '触发文风自动学习（每5章一次）...',
-          'Starting automatic style learning (every five chapters)...',
+          '  世界观更新结果无法解析，本次跳过落袋',
+          '  The world-setting update result could not be parsed; skipped this time',
         ))
-        const { AnalyzeWritingStyleCommand } = await import('./analyze-style.command')
-        await new AnalyzeWritingStyleCommand().execute({
-          step: {} as unknown,
-          context,
-          callbacks,
+        return
+      }
+
+      /**
+       * 可解析条目池：本章引用的条目 + 全库已有条目（按 id 去重）。
+       *
+       * 为什么必须带上全库：正文可能引出**从未被本章声明引用**的既有条目 ——
+       * 本步骤开头点名要覆盖这个场景。旧实现只在 `referenced` 里解析名字，
+       * 于是「本章没有引用任何条目」时，模型报上来的每一条进展都必然匹配失败
+       * 并被静默丢弃：作者只看到「4/4 成功」，库里却一条候选都没多。
+       */
+      interface ResolvableSettingEntry {
+        id: number
+        name: string
+        aliases: string[]
+        summary: string
+        content: string
+      }
+      const resolvableEntries: ResolvableSettingEntry[] = []
+      const seenEntryIds = new Set<number>()
+      for (const entry of [...referenced, ...allEntries]) {
+        if (!entry || typeof entry !== 'object') continue
+        const { id, name } = entry
+        if (typeof id !== 'number' || !Number.isInteger(id) || seenEntryIds.has(id)) continue
+        if (typeof name !== 'string' || !name.trim()) continue
+        seenEntryIds.add(id)
+        resolvableEntries.push({
+          id,
+          name,
+          aliases: Array.isArray(entry.aliases)
+            ? entry.aliases.filter((alias): alias is string => typeof alias === 'string')
+            : [],
+          summary: typeof entry.summary === 'string' ? entry.summary : '',
+          content: typeof entry.content === 'string' ? entry.content : '',
         })
+      }
+
+      /**
+       * 把一个模型返回的名字解析成真实条目 id。
+       *
+       * 为什么不能只用精确匹配：模型对同一个设定的措辞经常与条目名有细微差异
+       * （全半角、空格、加不加「设定」后缀、用别名）——
+       * 精确匹配一旦失手，这条进展就被**静默丢弃**，作者只会觉得"没生效"。
+       * 所以按「全等 → 别名 → 包含」三级放宽，并且**记住失手**以留下日志线索。
+       */
+      const resolveEntryId = (rawName: string): number | null => {
+        const wanted = rawName.trim()
+        if (!wanted) return null
+        const folded = wanted.toLowerCase()
+        for (const entry of resolvableEntries) {
+          if (entry.name === wanted) return entry.id
+        }
+        for (const entry of resolvableEntries) {
+          if (entry.name.toLowerCase() === folded) return entry.id
+        }
+        for (const entry of resolvableEntries) {
+          // 别名/别称：作者在条目里登记过的其他叫法，命中即可
+          if (entry.aliases.some(alias => alias.toLowerCase() === folded)) return entry.id
+        }
+        // 包含关系（如「感官交易所」↔「交易所」）：长度更贴近的那个优先，避免误配到很长的条目名
+        const candidates = resolvableEntries.filter(entry => (
+          entry.name.includes(wanted)
+          || wanted.includes(entry.name)
+          || entry.aliases.some(alias => alias.includes(wanted) || wanted.includes(alias))
+        ))
+        if (candidates.length === 0) return null
+        candidates.sort((left, right) => (
+          Math.abs(left.name.length - wanted.length) - Math.abs(right.name.length - wanted.length)
+        ))
+        return candidates[0].id
+      }
+      const idToEntry = new Map(resolvableEntries.map(entry => [entry.id, entry]))
+
+      // 记下「模型报了、但对不上任何条目」的名字，供日志排查（否则无从下手）。
+      const unresolvedNames = new Set<string>()
+      /**
+       * 对不上任何条目的 updates：它们其实是「正文引出、库里还没有」的设定。
+       * 旧实现只记一笔日志然后丢弃 —— 作者永远不会知道正文里多了什么设定，
+       * 只看到这一步"成功"。这里降级为待确认候选，与 newEntities 走同一条
+       * 落库路径，由作者在待确认队列里裁决。
+       */
+      const unmatchedAsCandidates: Array<{ name: string; evidence: string; statement: string }> = []
+
+      // ① 事实演进：有原文证据 → 自动追加（仓储侧只增不改，作者原文一个字都不动）
+      let appendedCount = 0
+      for (const item of proposal.updates) {
+        if (!item.evidence.trim() || !item.statement.trim()) continue
+        const entryId = resolveEntryId(item.entryName)
+        if (entryId === null) {
+          unresolvedNames.add(item.entryName)
+          unmatchedAsCandidates.push({
+            name: item.entryName,
+            evidence: item.evidence,
+            statement: item.statement,
+          })
+          continue
+        }
+        const result = await ipc.invoke(
+          'world-setting:append-derived',
+          entryId,
+          { content: item.statement.trim() },
+          chapterNumber,
+          expectedProjectPath,
+        )
+        if (result && typeof result === 'object' && 'appended' in result && result.appended) {
+          appendedCount += 1
+        }
+      }
+
+      // ② 直接冲突：绝不自动改 —— 「两个事实打架」时 AI 不知道该听哪边，
+      //    写进 updates 会把作者原本正确的设定改掉。
+      //    落进裁决队列，让作者在界面上并排对照后一键处理（不必自己去库里翻找）。
+      let conflictCount = 0
+      for (const item of proposal.conflicts) {
+        const entryId = resolveEntryId(item.entryName)
+        if (entryId === null) {
+          unresolvedNames.add(item.entryName)
+          continue
+        }
+        const entry = idToEntry.get(entryId)
+        if (!entry) continue
+        const recorded = await ipc.invoke(
+          'world-setting:record-conflict',
+          {
+            chapterNumber,
+            settingId: entry.id,
+            settingName: entry.name,
+            settingContentSnapshot: entry.content || entry.summary || '',
+            evidence: item.evidence.trim(),
+            statement: item.statement.trim(),
+          },
+          expectedProjectPath,
+        )
+        if (recorded && typeof recorded === 'object' && 'id' in recorded) conflictCount += 1
+      }
+
+      // ③ 新实体 + 对不上条目的进展：都存成待确认候选，作者确认后才成为事实源。
+      let pendingCount = 0
+      const queuedCandidateNames = new Set<string>()
+      const pendingInputs = [
+        ...proposal.newEntities.map(item => ({
+          name: item.name,
+          evidence: item.evidence,
+          statement: item.statement,
+        })),
+        // 模型把「正文引出、库里还没有」的设定误报成既有条目的进展时，
+        // 它们是同一个东西，必须一起进入候选，而不是被丢掉。
+        ...unmatchedAsCandidates,
+      ]
+      for (const item of pendingInputs) {
+        const name = item.name.trim()
+        if (!name || !item.statement.trim()) continue
+        // 同一件事可能同时出现在 updates 与 newEntities（提示词要求不要两边都写，
+        // 但模型会犯），按身份去重后只建一条候选。
+        const candidateKey = name.toLowerCase()
+        if (queuedCandidateNames.has(candidateKey)) continue
+        queuedCandidateNames.add(candidateKey)
+        // 已经存在的条目（含别名、含全库）不该再建一条 ——
+        // 但它的内容可能是本章新写的，所以转为「追加进展」而不是一丢了之。
+        const existingEntry = allEntries.find(entry => (
+          entry && typeof entry === 'object'
+          && (entry.name === name
+            || entry.name.toLowerCase() === name.toLowerCase()
+            || (Array.isArray(entry.aliases) && entry.aliases.some(alias => alias === name)))
+        ))
+        if (existingEntry && typeof (existingEntry as { id?: unknown }).id === 'number') {
+          const existingId = (existingEntry as { id: number }).id
+          const appended = await ipc.invoke(
+            'world-setting:append-derived',
+            existingId,
+            { content: item.statement.trim() },
+            chapterNumber,
+            expectedProjectPath,
+          )
+          if (appended && typeof appended === 'object' && 'appended' in appended && appended.appended) {
+            appendedCount += 1
+          }
+          continue
+        }
+        const saved = await ipc.invoke(
+          'world-setting:save',
+          {
+            category: 'world',
+            name,
+            content: `${item.statement.trim()}\n\n依据（第${chapterNumber}章）：${item.evidence.trim()}`,
+            source: 'ai',
+            status: 'pending',
+            provenance: { content: { kind: 'derived', chapterNumber } },
+          },
+          expectedProjectPath,
+        )
+        if (saved && typeof saved === 'object' && 'id' in saved) pendingCount += 1
+      }
+
+      const summaryParts: string[] = []
+      if (appendedCount > 0) summaryParts.push(
+        workflowUiText(context, `${appendedCount} 条已更新`, `${appendedCount} updated`),
+      )
+      if (conflictCount > 0) summaryParts.push(
+        workflowUiText(context, `${conflictCount} 条冲突待裁决`, `${conflictCount} conflicts need review`),
+      )
+      if (pendingCount > 0) summaryParts.push(
+        workflowUiText(context, `${pendingCount} 条新设定待确认`, `${pendingCount} new entries pending review`),
+      )
+      if (summaryParts.length > 0) {
         callbacks.log(workflowUiText(
           context,
-          '文风分析完成，已更新配置',
-          'Style analysis completed and the configuration was updated.',
+          `世界观设定：${summaryParts.join('，')}`,
+          `World settings: ${summaryParts.join(', ')}`,
         ))
-      },
-    })
-  }
+      } else if (referenced.length > 0 || unresolvedNames.size > 0) {
+        // 有引用却一条都没落袋、或者模型报了名字却一条都对不上：这是最需要排查的
+        // 情况，必须留下可查的线索。旧条件只看 referenced.length，于是「本章没有引用
+        // 任何条目」时整步静默 —— 作者只看到"4/4 成功"，库里却什么都没多。
+        const unresolvedHint = unresolvedNames.size > 0
+          ? workflowUiText(
+            context,
+            `（模型报了对不上的条目名：${Array.from(unresolvedNames).join('、')}）`,
+            ` (the model named entries that could not be matched: ${Array.from(unresolvedNames).join(', ')})`,
+          )
+          : workflowUiText(
+            context,
+            '（模型未报告任何事实变化）',
+            ' (the model reported no factual changes)',
+          )
+        callbacks.log(workflowUiText(
+          context,
+          `世界观设定：本次无更新${unresolvedHint}`,
+          `World settings: nothing updated this time${unresolvedHint}`,
+        ))
+      }
+    },
+  })
 
   return steps
 }
@@ -538,6 +958,7 @@ export interface RunFinalizePostProcessParams {
   draftContent: string
   draftId: number
   sourceLabel: string
+  finalizedSource: FinalizedSourceIdentity
   stopOnFailure?: boolean
   onlyFailed?: boolean
   stepKey?: string
@@ -559,6 +980,26 @@ export class RunFinalizePostProcessCommand extends BaseWorkflowCommand<PostProce
 
   private async executeWithinGeneration({ context, callbacks }: CommandExecuteParams): Promise<PostProcessStatus> {
     const projectSession = requireWorkflowProjectSession(context)
+    const finalizedSource = await ipc.invokeWithProjectSession(
+      projectSession,
+      'db:continuity-read-source',
+      this.params.draftId,
+      this.params.project.path,
+    )
+    const frozen = finalizedSource.status === 'valid' ? finalizedSource.snapshot : null
+    if (
+      !frozen
+      || frozen.source.draftId !== this.params.finalizedSource.draftId
+      || frozen.source.finalizationId !== this.params.finalizedSource.finalizationId
+      || frozen.source.chapterNumber !== this.params.finalizedSource.chapterNumber
+      || frozen.source.contentHash !== this.params.finalizedSource.contentHash
+    ) {
+      throw new Error(workflowUiText(
+        context,
+        '定稿正文来源收据已失效，后处理未启动',
+        'The finalized manuscript source receipt is stale, so post-processing was not started.',
+      ))
+    }
     const generation: FinalizePostProcessGeneration = {
       complete: async (builder, stepCallbacks, output, generationContext) => this.callLLM(
         builder.build(),
@@ -578,11 +1019,13 @@ export class RunFinalizePostProcessCommand extends BaseWorkflowCommand<PostProce
       this.params.project,
       this.params.chapterNumber,
       this.params.chapterTitle,
-      this.params.draftContent,
+      frozen.content,
       generation,
       this.params.draftId,
       this.params.chapterEntities,
       workflowUiLocale(context),
+      this.params.finalizedSource,
+      frozen.projectionGeneration,
     )
     const steps = this.params.stepKey
       ? allSteps.filter(step => step.key === this.params.stepKey)
@@ -712,6 +1155,12 @@ export class FinalizeChapterCommand extends BaseWorkflowCommand<void> {
       chapterTitle: snapshot.chapterTitle,
       draftContent: refinedDraftText,
       draftId: commit.draftId,
+      finalizedSource: {
+        draftId: commit.draftId,
+        finalizationId: commit.finalizationId,
+        chapterNumber: snapshot.chapterNumber,
+        contentHash: commit.contentHash,
+      },
       sourceLabel,
       stopOnFailure: this.params.stopOnPostProcessFailure,
       chapterEntities,

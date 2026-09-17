@@ -8,16 +8,25 @@ import {
     normalizeCharacterRole,
     type CharacterRole,
 } from '../../src/shared/character-role'
+import type {
+    CharacterRosterCharacterState,
+    CharacterStateFieldProvenance,
+    CharacterStateTextField,
+} from '../../src/shared/character-roster'
 
 /** 角色卡动态状态 */
-export interface CharacterStateData {
-    location: string
-    powerLevel: string
-    physicalState: string
-    mentalState: string
-    keyItems: string
-    recentEvents: string
-    updatedAtChapter: number
+export type CharacterStateData = CharacterRosterCharacterState
+
+function parseProvenance(value: unknown): Partial<Record<CharacterStateTextField, CharacterStateFieldProvenance>> {
+    if (typeof value !== 'string' || !value.trim()) return {}
+    try {
+        const parsed = JSON.parse(value) as unknown
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? parsed as Partial<Record<CharacterStateTextField, CharacterStateFieldProvenance>>
+            : {}
+    } catch {
+        return {}
+    }
 }
 
 /** 角色卡完整数据（前端驼峰接口） */
@@ -32,8 +41,23 @@ export interface CharacterData {
     abilities: string
     motivation: string
     relationships: string
+    /**
+     * 关系备注：作者填写的关系自由文本原话。它与 relationships 结构化边并存，
+     * 由独立的 relationship_notes 列承载，因此改边不会丢原文、改原文也不会
+     * 压掉边。任何通道都可写，但自动流程不得覆盖作者已有的非空备注。
+     */
+    relationshipNotes?: string
     arc: string
     notes: string
+    /**
+     * 自定义头像文件名（图片本体存 <项目>/.vela/avatars/）。空串 = 用姓名首字头像。
+     * 它是作者的手工资产，不属于角色事实：刻意不出现在 upsert/saveAll 的写入
+     * 与 ON CONFLICT 更新列表里，因此 AI 生成、蓝图同步、章节推进都覆盖不了它，
+     * 也不会进入角色名单的投影哈希。
+     * 声明为可选：只有 CharacterRepository 的读取会给它赋值，其余构造点（角色
+     * 名单投影、仿写归一化、测试夹具）无需为此多写一个字段。
+     */
+    avatar?: string
     currentState?: CharacterStateData
 }
 
@@ -56,11 +80,17 @@ function rowToData(row: Record<string, unknown>): CharacterData {
         relationships: (row.relationships as string) || '',
         arc: (row.arc as string) || '',
         notes: (row.notes as string) || '',
+        avatar: (row.avatar as string) || '',
     }
+
+    // 关系备注只在有内容时出现：空备注不进入角色卡形状，避免污染逐字段比较。
+    const relationshipNotes = ((row.relationship_notes as string) || '').trim()
+    if (relationshipNotes) data.relationshipNotes = relationshipNotes
 
     // currentState 存在与否由列是否为 NULL 决定（chapter 0 为合法状态）
     const updatedChapter = row.cs_updated_at_chapter as number | null
     if (updatedChapter !== null && updatedChapter !== undefined) {
+        const provenance = parseProvenance(row.cs_provenance)
         data.currentState = {
             location: (row.cs_location as string) || '',
             powerLevel: (row.cs_power_level as string) || '',
@@ -69,6 +99,9 @@ function rowToData(row: Record<string, unknown>): CharacterData {
             keyItems: (row.cs_key_items as string) || '',
             recentEvents: (row.cs_recent_events as string) || '',
             updatedAtChapter: updatedChapter,
+            // Pre-provenance ready rosters hashed the state without this key.
+            // Keep an empty migrated column serialized in that legacy shape.
+            ...(Object.keys(provenance).length > 0 ? { provenance } : {}),
         }
     }
 
@@ -129,10 +162,11 @@ export class CharacterRepository {
         db.prepare(`
       INSERT INTO characters (
         name, role, gender, age, appearance, personality, background,
-        abilities, motivation, relationships, arc, notes,
+        abilities, motivation, relationships, relationship_notes, arc, notes,
         cs_location, cs_power_level, cs_physical_state, cs_mental_state,
         cs_key_items, cs_recent_events, cs_updated_at_chapter
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        , cs_provenance
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(name) DO UPDATE SET
         role = excluded.role,
         gender = excluded.gender,
@@ -143,6 +177,7 @@ export class CharacterRepository {
         abilities = excluded.abilities,
         motivation = excluded.motivation,
         relationships = excluded.relationships,
+        relationship_notes = excluded.relationship_notes,
         arc = excluded.arc,
         notes = excluded.notes,
         cs_location = excluded.cs_location,
@@ -152,6 +187,7 @@ export class CharacterRepository {
         cs_key_items = excluded.cs_key_items,
         cs_recent_events = excluded.cs_recent_events,
         cs_updated_at_chapter = excluded.cs_updated_at_chapter,
+        cs_provenance = excluded.cs_provenance,
         updated_at = datetime('now')
     `).run(
             data.name,
@@ -164,6 +200,7 @@ export class CharacterRepository {
             data.abilities,
             data.motivation,
             data.relationships,
+            data.relationshipNotes ?? '',
             data.arc,
             data.notes,
             cs?.location ?? '',
@@ -173,6 +210,7 @@ export class CharacterRepository {
             cs?.keyItems ?? '',
             cs?.recentEvents ?? '',
             cs?.updatedAtChapter ?? null,
+            JSON.stringify(cs?.provenance ?? {}),
         )
     }
 
@@ -295,6 +333,32 @@ export class CharacterRepository {
         db.prepare('DELETE FROM characters WHERE name = ?').run(name)
     }
 
+    /** 读取自定义头像文件名；空串表示该角色使用姓名首字头像。 */
+    static getAvatarFileName(name: string): string {
+        const db = getProjectDb()
+        if (!db) return ''
+
+        const row = db.prepare('SELECT avatar FROM characters WHERE name = ?')
+            .get(name) as { avatar?: string } | undefined
+        return row?.avatar || ''
+    }
+
+    /**
+     * 只写头像文件名。头像不进 upsert/saveAll：它是作者的手工资产，
+     * 不属于角色事实，既不参与角色名单投影哈希，也不得被 AI 生成、
+     * 蓝图同步或章节推进覆盖。角色改名时本列随主键行一起保留。
+     */
+    static setAvatar(name: string, fileName: string): boolean {
+        const db = getProjectDb()
+        if (!db) return false
+
+        const result = db.prepare(`
+      UPDATE characters SET avatar = ?, updated_at = datetime('now')
+      WHERE name = ?
+    `).run(fileName, name)
+        return result.changes > 0
+    }
+
     /** 仅更新角色动态状态（后处理时使用） */
     static updateState(name: string, state: CharacterStateData): void {
         const db = getProjectDb()
@@ -305,6 +369,7 @@ export class CharacterRepository {
         cs_location = ?, cs_power_level = ?, cs_physical_state = ?,
         cs_mental_state = ?, cs_key_items = ?, cs_recent_events = ?,
         cs_updated_at_chapter = ?, updated_at = datetime('now')
+        , cs_provenance = ?
       WHERE name = ?
     `).run(
             state.location,
@@ -314,6 +379,7 @@ export class CharacterRepository {
             state.keyItems,
             state.recentEvents,
             state.updatedAtChapter,
+            JSON.stringify(state.provenance ?? {}),
             name,
         )
     }
